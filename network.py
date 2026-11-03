@@ -23,6 +23,8 @@ class SocketCordNetwork(QThread):
         self._close_reason = 'Disconnected'
         self._send_lock = threading.lock()
     # Configure host and port
+    def match_conf(self, host, port):
+        return self.host == host and self.port == port
     def conf(self, host, port):
         if self.running or self.connected:
             self.error.emit("Can't reconfigure connection while it's running!")
@@ -47,13 +49,14 @@ class SocketCordNetwork(QThread):
                 self.client_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+    # THE Disconnect
     def disconnect(self):
         self._stop('Disconnected')
     def stop(self):
         self.disconnect()
     def on_closed(self):
         self._stop('Connection Closed')
-    # Connects to that socket
+    # Connects to that socket (THE Connect)
     def connect(self):
         if self._active():
             self.error.emit("Already Connected or Connecting")

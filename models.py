@@ -1,17 +1,27 @@
 import struct
 import zlib
 import uuid
+import json
+from typing import ClassVar
 from dataclasses import dataclass, field
+
+NIL_UUID = uuid.UUID(int=0)
+ 
+def _json_default(obj):
+    # Lets a UUID sit in the dict (e.g. a chat_id / user_id) without the caller str()-ing it.
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    raise TypeError(f"{type(obj).__name__} is not JSON serializable!")
 
 @dataclass
 class RequestCord:
     """Class for the request as defined in protocol in README.md"""
     method: int = 0 # 32b
-    user_id: uuid.UUID = uuid.UUID(int=0)# UUID, must always be 128 bits -> 16 bytes long
-    ses_token: uuid.UUID = uuid.UUID(int=0)# UUID
+    user_id: uuid.UUID = field(default_factory=lambda: RequestCord._auth[0])# UUID, must always be 128 bits -> 16 bytes long
+    ses_token: uuid.UUID = field(default_factory=lambda: RequestCord._auth[1])# UUID
     url: str = '' # string -> len = url_sz
     msg: str = '' # string -> msg = msg_sz
-
+    _auth: ClassVar[tuple] = (NIL_UUID, NIL_UUID)
     # derived header fields (read-only)
     @property
     def url_sz(self):   # 16b
@@ -29,6 +39,18 @@ class RequestCord:
     def msg_cs(self):   # 32b
         return zlib.crc32(self._encoded()[1])
 
+    # build this request from dict
+    @classmethod
+    def from_dict(cls, method, url, data=None, user_id=None, ses_token=None):
+        if (user_id is None) != (ses_token is None):
+            raise ValueError("pass both user_id and ses_token, or neither")
+        if user_id is None:
+            req = cls(method=method, url=url)
+        else:
+            req = cls(method=method, user_id=user_id, ses_token=ses_token, url=url)
+        req.set_dict(data)
+        return req
+
     # post-init
     def __post_init__(self):
         # set uuid
@@ -36,10 +58,26 @@ class RequestCord:
             self.user_id = uuid.UUID(self.user_id)
         if isinstance(self.ses_token, str):
             self.ses_token = uuid.UUID(self.ses_token)
-
-        # gen message size + cs
-        url_bytes = self.url.encode('utf-8')
-        msg_bytes = self.msg.encode('utf-8')
+    # dict setter
+    def set_dict(self, data):
+        if data is None:
+            self.msg = ''
+            return
+        if not isinstance(data, dict):
+            raise ValueError(f'Trying to convert non-dict {type(data).__name__} into request!')
+        try:
+            self.msg = json.dumps(data, ensure_ascii=False, separators=(',', ':'),default=_json_default)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"message data is not JSON serializable: {e}") from None
+    # auth setter - let's set both at the same time
+    @classmethod
+    def set_auth(cls, user_id, ses_token):
+        uid = cls._as_uuid(user_id, "user_id")
+        tok = cls._as_uuid(ses_token, "ses_token")
+        cls._auth = (uid, tok)
+    @classmethod
+    def clear_auth(cls):
+        cls._auth = (NIL_UUID, NIL_UUID)
     # UUID
     @staticmethod
     def _as_uuid(value, name):
