@@ -15,6 +15,14 @@ class LoginPage(QWidget):
         super().__init__(parent)
         self.init_ui()
 
+    # setting property live update
+    @staticmethod
+    def _set_prop(widget, name, value):
+        widget.setProperty(name, value)
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+
     def init_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setAlignment(Qt.AlignCenter)
@@ -38,6 +46,7 @@ class LoginPage(QWidget):
         card_layout = QVBoxLayout(card_frame)
         card_layout.setContentsMargins(12, 12, 12, 14)
         card_layout.setSpacing(12)
+        column_layout.addWidget(card_frame,alignment=Qt.AlignLeft)
 
         # Title instruction
         title_lbl = QLabel("Please sign into the desired server")
@@ -64,6 +73,7 @@ class LoginPage(QWidget):
         )
         for row, (text, field) in enumerate(self.form_rows):
             field.setProperty('status','ok')
+            field.setObjectName('Inputter')
             form_layout.addWidget(QLabel(text), row, 0)
             form_layout.addWidget(field, row, 1)
         card_layout.addLayout(form_layout)
@@ -80,7 +90,7 @@ class LoginPage(QWidget):
         btn_layout.addStretch(1)
         btn_layout.addWidget(self.login_btn)
 
-        column_layout.addLayout(btn_layout)
+        card_layout.addLayout(btn_layout)
 
         # Status text below container
         self.status_label = QLabel("")
@@ -92,6 +102,7 @@ class LoginPage(QWidget):
         self.status_label.setMinimumHeight(66)
         column_layout.addWidget(self.status_label)
 
+        # column_layout.addLayout(card_frame)
         main_layout.addWidget(column)
 
         # Connect button clicks
@@ -103,46 +114,48 @@ class LoginPage(QWidget):
         errs = [] # error array
         # reset status
         for row, (text, field) in enumerate(self.form_rows):
-            field.setProperty('status','ok')
+            self._set_prop(field, 'status', 'ok')
         # validate things
         ip = self.ip_input.text().strip()
         if not ip:
-            self.ip_input.setProperty('status','error')
+            self._set_prop(self.ip_input, 'status', 'error')
             errs.append('Backend IP')
         try:
             port = int(self.port_input.text().strip())
             if not 1 <= port <= 65535:
                 raise ValueError
         except ValueError:
-            self.port_input.setProperty('status','error')
+            self._set_prop(self.port_input, 'status', 'error')
             errs.append('Valid Port (1-65535)')
         username = self.username_input.text().strip()
         if not username:
-            self.username_input.setProperty('status','error')
+            self._set_prop(self.username_input, 'status', 'error')
             errs.append('Username')
         # raw text
         password = self.password_input.text()
         if not password:
-            self.password_input.setProperty('status','error')
+            self._set_prop(self.password_input, 'status', 'error')
             errs.append('Password')
         # error array must be empty
         if len(errs) == 0:
             return ip, port, username, password
         else:
-            self.set_status(f"Please enter the following: {errs.join(', ')}", False)
+            self.set_status(f"Please enter the following: {', '.join(errs)}", False)
             return None
 
     # handler
     def handle_login_click(self):
         form = self._read_form()
         if form:
-            self.login_btn.setProperty('status','processing')
+            self.set_status('Signing up...', True)
+            self._set_prop(self.login_btn, 'status', 'processing')
             self.login_requested.emit(*form)
  
     def handle_signup_click(self):
         form = self._read_form()
         if form:
-            self.signup_btn.setProperty('status','processing')
+            self.set_status('Logging in...', True)
+            self._set_prop(self.signup_btn, 'status', 'processing')
             self.signup_requested.emit(*form)
 
     # router functions

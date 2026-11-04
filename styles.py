@@ -12,7 +12,7 @@ _QSS = Template("""
 QWidget {
     background-color: $white;
     color: $black;
-    font-family: 'Source Sans Pro';
+    font-family: 'Source Sans 3';
     font-size: 13pt;
 }
  
@@ -26,7 +26,7 @@ QLineEdit {
     selection-color: $white;
 }
  
-QLineEdit[status='error']{
+QLineEdit#Inputter[status="error"]{
     border: 2px solid $red;
 }
 
@@ -92,6 +92,7 @@ QLabel#WelcomeTag {
     font-style: italic;
     text-decoration: underline;
     padding: 0px 12px;
+    letter-spacing: 1px;
 }
  
 /* Status line below the card: red by default (failure), blue on success */

@@ -1,5 +1,7 @@
 import sys
+from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget
+from PySide6.QtGui import QFontDatabase
 from PySide6.QtCore import QThread, Signal, Slot
 
 from styles import APP_STYLESHEET
@@ -8,17 +10,53 @@ from models import RequestCord
 from login_page import LoginPage
 # from chat_page import ChatPage
 
+# method codes
+POST_MTDC = 112233445
+GET_MTDC = 354984100
+PATCH_MTDC = 943742156
+
+# font loader
+def load_fonts():
+    # pathing
+    base_dir = Path(__file__).resolve().parent
+    font_path_main = base_dir / "fonts" / "SourceSans3-VariableFont_wght.ttf"
+    font_path_italic = base_dir / "fonts" / "SourceSans3-Italic-VariableFont_wght.ttf"
+    # register it all
+    if not font_path_main.exists():
+        print(f"Default font file missing at {font_path_main}. This is very sad.")
+    if not font_path_italic.exists():
+            print(f"Italic font file missing at {font_path_italic}. This is very sad.")
+
+    font_id = QFontDatabase.addApplicationFont(str(font_path_main))
+    # print(font_id)
+    if font_id == -1:
+        print(f"Failed to load font binary from {font_path_main}. This is very sad.")
+    else:
+        QFontDatabase.addApplicationFont(str(font_path_italic))
+
+    families = QFontDatabase.applicationFontFamilies(font_id)
+    if families:
+        loaded_family = families[0]
+        print(f"[FontEngine] Successfully registered '{loaded_family}'")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SocketCord")
         self.resize(900, 640)
 
+        # load fonts
+        load_fonts()
+
         # Apply global QSS stylesheet
         self.setStyleSheet(APP_STYLESHEET)
 
         # Networking Manager
-        self.network = SocketCordNetwork()
+        self.network = SocketCordNetwork('127.0.0.1',8080)
+        self.req_pending = {} # pending req due to turned off socket
+        self.cur_username = ''
+        self.cur_password = ''
 
         # Screen management stack (Index 0: Login, Index 1: Chat)
         self.stacked_widget = QStackedWidget()
@@ -56,8 +94,12 @@ class MainWindow(QMainWindow):
             self.network.disconnect()
             self.network.conf(ip, port)
             self.network.connect()
+            self.req_pending.insert('login')
+            self.cur_password = password
+            self.cur_username = username
+            return
         if self.network._active():
-            req = RequestCord.from_dict(67,'users/login',{"username":username,"password":password})
+            req = RequestCord.from_dict(POST_MTDC,'users/login',{"username":username,"password":password})
             self.network.send(req)
     @Slot(str, int, str, str)
     def do_signup(self, ip, port, username, password):
@@ -66,14 +108,29 @@ class MainWindow(QMainWindow):
             self.network.disconnect()
             self.network.conf(ip, port)
             self.network.connect()
+            self.req_pending.insert('register')
+            self.cur_password = password
+            self.cur_username = username
+            return
         if self.network._active():
-            req = RequestCord.from_dict(67,'users',{"username":username,"password":password})
+            req = RequestCord.from_dict(POST_MTDC,'users',{"username":username,"password":password})
             self.network.send(req)
     @Slot(str)
     def handle_connection_error(self, details):
-        pass
+        self.login_page.set_status(details, False)
     @Slot(bool, str)
     def handle_connection_result(self, success, message):
+        if success:
+            # clear any queue
+            if 'login' in self.req_pending:
+                req = RequestCord.from_dict(POST_MTDC,'users/login',{"username":self.cur_username,"password":self.cur_password})
+                self.network.send(req)
+            if 'register' in self.req_pending:
+                req = RequestCord.from_dict(POST_MTDC,'users',{"username":self.cur_username,"password":self.cur_password})
+                self.network.send(req)
+            self.cur_username = ''
+            self.cur_password = ''
+            self.req_pending.clear()
         pass
 
     def closeEvent(self, event):
