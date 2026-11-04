@@ -21,7 +21,7 @@ class SocketCordNetwork(QThread):
         self.recv_buffer = bytearray()
         self.selector = selectors.DefaultSelector()
         self._close_reason = 'Disconnected'
-        self._send_lock = threading.lock()
+        self._send_lock = threading.Lock()
     # Configure host and port
     def match_conf(self, host, port):
         return self.host == host and self.port == port
@@ -73,8 +73,7 @@ class SocketCordNetwork(QThread):
         try:
             try:
                 # socket connection
-                cur_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                cur_socket.connect((self.host, self.port), timeout = 4.0)
+                cur_socket = socket.create_connection((self.host, self.port), timeout=4.0)
                 # self.client_socket.setblocking(False)
             except socket.timeout:
                 self.connection_status.emit(False, "Connection Timed Out")
@@ -88,7 +87,7 @@ class SocketCordNetwork(QThread):
             # successful connection
             sel = selectors.DefaultSelector()
             sel.register(
-                self.client_socket, 
+                cur_socket, 
                 selectors.EVENT_READ, 
                 data=self.handle_read
             )
@@ -122,7 +121,7 @@ class SocketCordNetwork(QThread):
     def handle_read(self, socket: socket.socket, mask=None):
         try:
             data = socket.recv(65536)
-        except (BlockingIOError, socket.timeout):
+        except BlockingIOError:
             pass
         except OSError as e:
             self.error.emit(f"Packet Receiving Error: {str(e)}")
@@ -153,10 +152,11 @@ class SocketCordNetwork(QThread):
             # unpack
             try:
                 str_msg = raw_msg.decode('utf-8')
+                obj = json.loads(str_msg)
             except Exception as e:
                 self.error.emit(f'JSON Parsing Error: {str(e)}')
                 continue
-            self.reply_message.emit(status_code,json.loads(str_msg))
+            self.reply_message.emit(status_code,obj)
 
     # Sends a request packet, literally
     def send(self, req:RequestCord):
@@ -167,6 +167,9 @@ class SocketCordNetwork(QThread):
             with self._send_lock:
                 self.client_socket.sendall(req.pack())
             return True
+        except ValueError as e:
+            self.error.emit(f'Invalid Request: {e}')
+            return False
         except Exception as e:
             self.error.emit(f'Sending Error: {e}')
             self._stop("Connection Lost")

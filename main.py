@@ -41,8 +41,15 @@ class MainWindow(QMainWindow):
 
     # the great ROUTER
     @Slot(int, object)
-    def handle_reply(self, status_code, data):
-        pass
+    def handle_reply(self, status_code, data_obj):
+        path = ''
+        if 'path' in data_obj:
+            path = data_obj['path']
+            del data_obj['path']
+        # if path explicitly specifies a module, then route to that module
+        path_spl = path.split('/')
+        if path_spl[0].to_lower() == 'login':
+            self.login_page.router(status_code,'/'.join(path_spl[1:]),data_obj)
     @Slot(str, int, str, str)
     def do_signin(self, ip, port, username, password):
         if not self.network.match_conf(ip, port):
