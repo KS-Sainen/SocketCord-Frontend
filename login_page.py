@@ -109,6 +109,10 @@ class LoginPage(QWidget):
         self.login_btn.clicked.connect(self.handle_login_click)
         self.signup_btn.clicked.connect(self.handle_signup_click)
 
+    def reset_buttons(self):
+        for btn in (self.signup_btn, self.login_btn):
+            self._set_prop(btn, 'status', 'pending')
+
     # form validation
     def _read_form(self):
         errs = [] # error array

@@ -118,11 +118,11 @@ class SocketCordNetwork(QThread):
             self.recv_buffer = bytearray()
             self.connection_status.emit(False, self._close_reason)
     # Handles incoming packets into a receiving buffer
-    def handle_read(self, socket: socket.socket, mask=None):
+    def handle_read(self, sock: socket.socket, mask=None):
         try:
-            data = socket.recv(65536)
+            data = sock.recv(65536)
         except BlockingIOError:
-            pass
+            return
         except OSError as e:
             self.error.emit(f"Packet Receiving Error: {str(e)}")
             self._stop('Connection Lost')

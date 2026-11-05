@@ -88,11 +88,11 @@ QFrame#PanelFrame QPushButton {
 QLabel#WelcomeTag {
     background-color: $black;
     color: $white;
-    font-size: 17pt;
+    font-size: 22pt;
     font-style: italic;
     text-decoration: underline;
     padding: 0px 12px;
-    letter-spacing: 1px;
+    letter-spacing: 2px;
 }
  
 /* Status line below the card: red by default (failure), blue on success */

@@ -112,5 +112,5 @@ class RequestCord:
     # turns into a sendable packet
     def pack(self):
         user_id, ses_token, url_b, msg_b = self.validate()
-        header = struct.pack("!I16s16sHHII",self.method,user_id,ses_token,len(url_b), len(msg_b), zlib.crc32(url_b), zlib.crc32(msg_b))
+        header = struct.pack("!I16s16sHHII",self.method,user_id.bytes,ses_token.bytes,len(url_b), len(msg_b), zlib.crc32(url_b), zlib.crc32(msg_b))
         return header + url_b + msg_b

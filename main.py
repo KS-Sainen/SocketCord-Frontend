@@ -54,9 +54,7 @@ class MainWindow(QMainWindow):
 
         # Networking Manager
         self.network = SocketCordNetwork('127.0.0.1',8080)
-        self.req_pending = {} # pending req due to turned off socket
-        self.cur_username = ''
-        self.cur_password = ''
+        self.req_pending = [] # pending req due to turned off socket
 
         # Screen management stack (Index 0: Login, Index 1: Chat)
         self.stacked_widget = QStackedWidget()
@@ -90,50 +88,61 @@ class MainWindow(QMainWindow):
             self.login_page.router(status_code,'/'.join(path_spl[1:]),data_obj)
     @Slot(str, int, str, str)
     def do_signin(self, ip, port, username, password):
-        if not self.network.match_conf(ip, port):
-            self.network.disconnect()
-            self.network.conf(ip, port)
-            self.network.connect()
-            self.req_pending.insert('login')
-            self.cur_password = password
-            self.cur_username = username
-            return
-        if self.network._active():
-            req = RequestCord.from_dict(POST_MTDC,'users/login',{"username":username,"password":password})
-            self.network.send(req)
+        self._login_page_send('login', ip, port, username, password)
     @Slot(str, int, str, str)
     def do_signup(self, ip, port, username, password):
         # Placeholder sign up routing to same connection skeleton
-        if not self.network.match_conf(ip, port):
-            self.network.disconnect()
-            self.network.conf(ip, port)
-            self.network.connect()
-            self.req_pending.insert('register')
-            self.cur_password = password
-            self.cur_username = username
+        self._login_page_send('login', ip, port, username, password)
+    # sending without knowing there might be a connection
+    def _login_page_send(self, cmd, ip, port, username, password):
+        net = self.network
+        self.pending = (cmd, username, password)
+        if net.connected and net.running and net.match_conf(ip, port):
+            self._flush_pending()
             return
-        if self.network._active():
-            req = RequestCord.from_dict(POST_MTDC,'users',{"username":username,"password":password})
-            self.network.send(req)
+        self.login_page.set_status(f"Connecting to {ip}:{port}...", True)
+        if net._active():
+            if net.match_conf(ip, port):
+                return
+            net.disconnect()
+            net.wait()
+        # conf failed
+        if not net.conf(ip, port):
+            return
+        net.connect()
+    def _flush_pending(self):
+        if self.pending is None:
+            return
+        kind, username, password = self.pending
+        self.pending = None
+        url = 'users/login' if kind == 'login' else 'users'
+        req = RequestCord.from_dict(POST_MTDC, url, {"username": username, "password": password})
+        self.network.send(req)
     @Slot(str)
     def handle_connection_error(self, details):
+        self.pending = None
+        self.login_page.reset_buttons()
         self.login_page.set_status(details, False)
     @Slot(bool, str)
     def handle_connection_result(self, success, message):
         if success:
-            # clear any queue
-            if 'login' in self.req_pending:
-                req = RequestCord.from_dict(POST_MTDC,'users/login',{"username":self.cur_username,"password":self.cur_password})
-                self.network.send(req)
-            if 'register' in self.req_pending:
-                req = RequestCord.from_dict(POST_MTDC,'users',{"username":self.cur_username,"password":self.cur_password})
-                self.network.send(req)
-            self.cur_username = ''
-            self.cur_password = ''
-            self.req_pending.clear()
-        pass
+            if self.network.connected:
+                self.login_page.set_status("", True)
+                self._flush_pending()
+            return
+        if message == "Disconnected":
+            return
+        if self.pending is not None:
+            text = f"Can't connect to {self.network.host}:{self.network.port} ({message})"
+        else:
+            text = message
+        self.pending = None
+        self.login_page.reset_buttons()
+        self.login_page.set_status(text, False)
 
     def closeEvent(self, event):
+        self.network.disconnect()
+        self.network.wait()
         event.accept()
 
 if __name__ == "__main__":
