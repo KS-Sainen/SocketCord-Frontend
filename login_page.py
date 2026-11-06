@@ -109,6 +109,14 @@ class LoginPage(QWidget):
         self.login_btn.clicked.connect(self.handle_login_click)
         self.signup_btn.clicked.connect(self.handle_signup_click)
 
+    # reset
+    def reset_form(self):
+        self.username_input.clear()
+        self.password_input.clear()
+        for _, field in self.form_rows:
+            self._set_prop(field, 'status', 'ok')
+        self.reset_buttons()
+        self.set_status("", True)
     def reset_buttons(self):
         for btn in (self.signup_btn, self.login_btn):
             self._set_prop(btn, 'status', 'pending')
@@ -166,6 +174,7 @@ class LoginPage(QWidget):
     def router(self, status_code, path, data_obj):
         # path_spl = path.split('/')
         # honestly, only the created user reply reaches here, so only handle by the connection
+        self.reset_buttons()
         if status_code == 200:
             self.set_status("User successfully created!", True)
     def set_status(self, text: str, success: bool = True):
