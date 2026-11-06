@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
 # Palette tokens come from styles.py. Never write a hex colour in this file.
 from styles import BLACK, WHITE, RED, BLUE, PALETTE
 from dialogs import (
-    EditProfileDialog, ChangePasswordDialog, NewGroupDialog, InviteDialog, MessageDialog, GroupsDialog
+    EditProfileDialog, ChangePasswordDialog, NewGroupDialog, InviteDialog, MessageDialog, GroupsDialog,
+    AddPeopleDialog
 )
 
 # ---------------------------------------------------------------------------------------
@@ -803,8 +804,22 @@ class ChatPage(QWidget):
         pass
 
     def add_people_to_group(self):
-        """Add-people icon in the chat header. -> POST /chat/{chat_id}/invite"""
-        pass
+        """Add-people icon in the chat header -> pop-up: search the online users and everyone the
+        user has a DM with, pick one, INVITE calls request_invite(username, chat_id, user_id)."""
+        if self._chat_id is None or self._pending or self._chat_is_dm():
+            return
+        chat_id = self._chat_id
+        dialog = AddPeopleDialog(chat_id, self)
+        dialog.searched.connect(lambda query: self.request_invitees(chat_id, query))
+        self._open_dialog("add_people", dialog, self.request_invite)
+        if self._dialog is dialog:
+            dialog.search("")                       # list everybody to start with
+
+    def set_invitees(self, chat_id, query, users):
+        """Reply to request_invitees: users = [{'user_id', 'username'}] matching `query`."""
+        d = self._dialog
+        if d is not None and self._dialog_kind == "add_people" and d.chat_id == chat_id:
+            d.set_users(query, users)
 
     def send_message(self):
         """Send button / Enter in the chat box. -> POST /chat/{chat_id}/message
@@ -831,8 +846,14 @@ class ChatPage(QWidget):
         """create a chat called `name`; afterwards refresh the directory with set_chats(...)"""
         pass
 
-    def request_invite(self, username, chat_id):
-        """POST /chat/{chat_id}/invite  {user}"""
+    def request_invite(self, username, chat_id, user_id=None):
+        """POST /chat/{chat_id}/invite  {user_id}
+        user_id is known when the user was picked in the Invite people pop-up; from the right-click
+        pop-up only the name is known, so take the id from the member row."""
+        pass
+
+    def request_invitees(self, chat_id, query):
+        """GET /chat/{chat_id}/invitees  {query} -> set_invitees(chat_id, query, users)"""
         pass
 
     def request_message(self, username, greeting):
@@ -1245,7 +1266,7 @@ class ChatPage(QWidget):
         self.chat_title.setText(("[DM] " if chat.get("is_dm") else "") + str(chat.get("name", "")))
         if pending:
             self.invite_text.setText(f"You've been invited to join the group {chat.get('name', '')}")
-        self.add_people_btn.setVisible(not pending)
+        self.add_people_btn.setVisible(not pending and not chat.get("is_dm"))   # groups only
         self.generate_summary_btn.setEnabled(not pending)
         if changed:                                  # nothing of the previous chat may linger
             self.chat_stack.setCurrentIndex(1 if pending else 0)
@@ -1405,6 +1426,11 @@ if __name__ == "__main__":
 
         def request_reject_invite(self, chat_id):
             QTimer.singleShot(600, lambda: self.resolve_invite(chat_id, False))
+
+        def request_invitees(self, chat_id, query):
+            people = ["lztech", "moss", "GreatGodChal..."]
+            hit = [{"user_id": n, "username": n} for n in people if query.lower() in n.lower()]
+            QTimer.singleShot(300, lambda: self.set_invitees(chat_id, query, hit))
 
         def request_user_groups(self, username):
             QTimer.singleShot(400, lambda: self.set_user_groups(username, [{"chat_id": 1, "name": "RECONSTRUCTION 3, 2, 1"}, {"chat_id": 2, "name": "Purgatory"}]))

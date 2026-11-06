@@ -12,7 +12,7 @@ from string import Template
 from PySide6.QtCore import Qt, Signal, QSize, QPointF, QEvent
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QListWidget, QListWidgetItem, QAbstractItemView, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
+    QStackedWidget, QListWidget, QListWidgetItem, QAbstractItemView, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
     QToolButton, QVBoxLayout, QWidget, QColorDialog, QStyle, QStyleOptionComboBox
 )
 
@@ -54,6 +54,20 @@ def dropper_icon(color):
     p.drawLine(48, 10, 24, 46)
     p.drawLine(48, 10, 72, 46)
     p.drawEllipse(QPointF(48, 62), 26, 26)
+    p.end()
+    return QIcon(px)
+
+
+def search_icon(color):
+    """Magnifying glass."""
+    px = QPixmap(96, 96)
+    px.fill(Qt.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(QColor(color), 9, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    p.setBrush(Qt.NoBrush)
+    p.drawEllipse(QPointF(40, 40), 24, 24)
+    p.drawLine(58, 58, 84, 84)
     p.end()
     return QIcon(px)
 
@@ -203,15 +217,22 @@ QLineEdit#DialogInput {
 QLineEdit#DialogInput:focus { border: 4px solid $blue; }
 QLineEdit#DialogInput[status="error"] { border: 4px solid $red; }
 
-QFrame#ColorRow { background-color: $black; border: none; }
-QFrame#ColorRow[focused="true"] { background-color: $blue; }
-QFrame#ColorRow[status="error"] { background-color: $red; }
-QLineEdit#HexInput, QLineEdit#HexInput:focus {
+QFrame#ColorRow, QFrame#SearchRow { background-color: $black; border: none; }
+QFrame#ColorRow[focused="true"], QFrame#SearchRow[focused="true"] { background-color: $blue; }
+QFrame#ColorRow[status="error"], QFrame#SearchRow[status="error"] { background-color: $red; }
+QLineEdit#HexInput, QLineEdit#HexInput:focus, QLineEdit#SearchInput, QLineEdit#SearchInput:focus {
     background-color: $white; color: $black; border: none; padding: 6px 8px; font-size: 14pt;
     selection-background-color: $black; selection-color: $white;
 }
-QToolButton#PickerButton { background-color: $black; border: none; }
-QToolButton#PickerButton:pressed { background-color: $blue; }
+QToolButton#PickerButton, QToolButton#SearchButton { background-color: $black; border: none; }
+QToolButton#PickerButton:pressed, QToolButton#SearchButton:pressed { background-color: $blue; }
+
+QFrame#ResultsFrame { background-color: $white; border: 4px solid $black; }
+QFrame#ResultsFrame[status="error"] { border: 4px solid $red; }
+QListWidget#ResultList { background-color: $white; border: none; outline: 0; font-size: 14pt; }
+QListWidget#ResultList::item { padding: 6px 8px; }
+QListWidget#ResultList::item:selected { background-color: $black; color: $white; }
+QLabel#ResultsMessage { font-size: 14pt; }
 
 QComboBox#DialogCombo {
     background-color: $white; color: $black; border: 4px solid $black;
@@ -513,3 +534,143 @@ class GroupsDialog(FormDialog):
 
     def shown_groups(self):
         return [self.group_list.item(i).text() for i in range(self.group_list.count())]
+
+
+# ---------------------------------------------------------------------------------------
+# "Invite people": search the people who can be invited, pick one
+# ---------------------------------------------------------------------------------------
+class _SearchEdit(QLineEdit):
+    entered = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()                      # Enter searches; it must not press the INVITE button
+            self.entered.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class SearchField(QFrame):
+    """[ search text | magnifying glass ]. Enter or the glass emits searched(text)."""
+    searched = Signal(str)
+
+    def __init__(self, placeholder="Type part of a name", parent=None):
+        super().__init__(parent)
+        self.setObjectName("SearchRow")
+        self.setProperty("status", "ok")
+        self.setProperty("focused", False)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(3, 3, 3, 3)
+        row.setSpacing(0)
+        self.edit = _SearchEdit()
+        self.edit.setObjectName("SearchInput")
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.installEventFilter(self)
+        row.addWidget(self.edit, 1)
+        self.button = QToolButton()
+        self.button.setObjectName("SearchButton")
+        self.button.setIcon(search_icon(WHITE))
+        self.button.setIconSize(QSize(22, 22))
+        self.button.setFixedWidth(48)
+        self.button.setToolTip("Search")
+        self.button.setCursor(Qt.PointingHandCursor)
+        row.addWidget(self.button)
+        self.edit.entered.connect(self.search)
+        self.button.clicked.connect(self.search)
+
+    def search(self):
+        self.searched.emit(self.edit.text().strip())
+
+    def text(self):
+        return self.edit.text()
+
+    def setFocus(self, *args):
+        self.edit.setFocus(*args)
+
+    def eventFilter(self, obj, event):
+        if obj is self.edit and event.type() in (QEvent.FocusIn, QEvent.FocusOut):
+            _set_prop(self, "focused", event.type() == QEvent.FocusIn)
+        return super().eventFilter(obj, event)
+
+
+class ResultsField(QFrame):
+    """Result list; a row is picked by clicking it (dark row, white text). When there is nothing to
+    list, a message sits in the middle of the field instead."""
+    LIST, MESSAGE = 0, 1
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ResultsFrame")
+        self.setFixedHeight(210)
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        self.stack = QStackedWidget()
+        box.addWidget(self.stack)
+        self.list = QListWidget()
+        self.list.setObjectName("ResultList")
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.message = QLabel("")
+        self.message.setObjectName("ResultsMessage")
+        self.message.setAlignment(Qt.AlignCenter)
+        self.message.setWordWrap(True)
+        self.stack.addWidget(self.list)
+        self.stack.addWidget(self.message)
+
+    def show_message(self, text):
+        self.list.clear()
+        self.message.setText(text)
+        self.stack.setCurrentIndex(self.MESSAGE)
+
+    def set_users(self, users):
+        """users: [{'user_id', 'username'}]"""
+        if not users:
+            self.show_message("No results")
+            return
+        self.list.clear()
+        for u in users:
+            item = QListWidgetItem(str(u.get("username", "")))
+            item.setData(Qt.UserRole, dict(u))
+            item.setToolTip(str(u.get("username", "")))
+            self.list.addItem(item)
+        self.stack.setCurrentIndex(self.LIST)
+
+    def selected(self):
+        items = self.list.selectedItems()
+        return dict(items[0].data(Qt.UserRole)) if items else None
+
+    def shown_names(self):
+        return [self.list.item(i).text() for i in range(self.list.count())]
+
+
+class AddPeopleDialog(FormDialog):
+    """Header button 'Invite people to group'. The owner answers each searched(query) with
+    set_users(query, users): the online users and everyone the user has a DM with that match."""
+    searched = Signal(str)
+
+    def __init__(self, chat_id, parent=None):
+        super().__init__("Invite people", parent, submit_text="INVITE")
+        self.chat_id = chat_id
+        self._query = None
+        self.search_field = self.add_field("search", "Search", SearchField())
+        self.results = self.add_field("user", "Users", ResultsField())
+        self.search_field.searched.connect(self.search)
+        self.search_field.setFocus()
+
+    def search(self, text=""):
+        self._query = str(text).strip()
+        self.results.show_message("Searching...")
+        self.searched.emit(self._query)
+
+    def set_users(self, query, users):
+        if query != self._query:
+            return                              # the answer to an older search
+        self.results.set_users(users)
+
+    def collect(self):
+        user = self.results.selected()
+        if user is None:
+            return {}, {"user": "Select a user"}
+        return {"username": user.get("username", ""), "chat_id": self.chat_id,
+                "user_id": user.get("user_id")}, {}
