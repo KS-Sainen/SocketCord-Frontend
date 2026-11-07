@@ -2,6 +2,11 @@ import socket, struct, threading, selectors, json, zlib
 from PySide6.QtCore import QThread, Signal, Slot
 from models import RequestCord
 
+# method codes
+POST_MTDC = 112233445
+GET_MTDC = 354984100
+PATCH_MTDC = 943742156
+
 # A Class that manages a SocketCord Socket
 class SocketCordNetwork(QThread):
     connection_status = Signal(bool, str)

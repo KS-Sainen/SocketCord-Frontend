@@ -5,15 +5,10 @@ from PySide6.QtGui import QFontDatabase
 from PySide6.QtCore import QThread, Signal, Slot
 
 from styles import APP_STYLESHEET
-from network import SocketCordNetwork
+from network import SocketCordNetwork, POST_MTDC, GET_MTDC, PATCH_MTDC
 from models import RequestCord
 from login_page import LoginPage
 from chat_page import ChatPage
-
-# method codes
-POST_MTDC = 112233445
-GET_MTDC = 354984100
-PATCH_MTDC = 943742156
 
 # font loader
 def load_fonts():
@@ -41,6 +36,8 @@ def load_fonts():
 
 
 class MainWindow(QMainWindow):
+    # comes in as a string, comes out as a string always
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SocketCord")
@@ -72,6 +69,7 @@ class MainWindow(QMainWindow):
         self.network.reply_message.connect(self.handle_reply)
         self.network.error.connect(self.handle_connection_error)
         self.network.connection_status.connect(self.handle_connection_result)
+        self.chat_page.request.connect(self.handle_request)
 
         self.worker = None
 
@@ -91,6 +89,19 @@ class MainWindow(QMainWindow):
         path_spl = path.split('/')
         if path_spl[0].lower() == 'login':
             self.login_page.router(status_code,'/'.join(path_spl[1:]),data_obj)
+            if path_spl[1].lower() == 'success':
+                self.cur_session = data_obj['session_token']
+                self.cur_user = data_obj['user_id']
+            elif path_spl[1].lower() == 'logout':
+                self.cur_session = ''
+                self.cur_user = ''
+        else:
+            # by default, we yeet it into chat page
+            self.chat_page.router(status_code,'/'.join(path_spl[1:]),data_obj)
+    # the great EMITTER
+    @Slot(RequestCord)
+    def handle_request(self, request):
+        net = self.network
     # request factory
     @Slot(str, int, str, str)
     def do_signin(self, ip, port, username, password):
@@ -98,7 +109,7 @@ class MainWindow(QMainWindow):
     @Slot(str, int, str, str)
     def do_signup(self, ip, port, username, password):
         # Placeholder sign up routing to same connection skeleton
-        self._login_page_send('login', ip, port, username, password)
+        self._login_page_send('signup', ip, port, username, password)
     @Slot()
     def do_logout(self):
         # banish back to login page

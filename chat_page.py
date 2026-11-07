@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
 )
 
 # Palette tokens come from styles.py. Never write a hex colour in this file.
+from models import RequestCord
+from network import POST_MTDC, GET_MTDC, PATCH_MTDC
 from styles import BLACK, WHITE, RED, BLUE, PALETTE
 from dialogs import (
     EditProfileDialog, ChangePasswordDialog, NewGroupDialog, InviteDialog, MessageDialog, GroupsDialog,
@@ -230,7 +232,7 @@ class MessageWidget(QFrame):
 
         head = QHBoxLayout()
         head.setSpacing(8)
-        name = UserBadge("You" if own else str(msg.get("sender", "?")), fg, bg)
+        name = UserBadge(str(msg.get("sender", "?")), fg, bg)
         head.addWidget(name, 0, Qt.AlignLeft)
         head.addStretch(1)
         dt = _as_datetime(msg.get("time"))
@@ -471,6 +473,9 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background-color:
 # ---------------------------------------------------------------------------------------
 class ChatPage(QWidget):
     logout_requested = Signal()             # main.py: disconnect the socket, back to the login page
+    request = Signal(RequestCord)
+    cur_user = ''
+    cur_session = ''
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -831,6 +836,10 @@ class ChatPage(QWidget):
         then feed set_members(..., chat_id), set_messages(..., chat_id=chat_id)."""
         pass
 
+    # The Great ROUTER
+    def router(self, status_code, path, data_obj):
+        pass
+
     # ------------------------------------------------------------------ dummy backend calls
     # Each one is where the RequestCord call goes (README: RequestCord Calls). They do nothing
     # yet. For the pop-up ones, answer with finish_dialog(ok, message, field).
@@ -885,6 +894,7 @@ class ChatPage(QWidget):
 
     def request_mark_read(self, chat_id):
         """The user scrolled to the bottom of the chat: tell the backend its messages are read."""
+
         pass
 
     # ------------------------------------------------------------------ pop-ups
@@ -1373,33 +1383,37 @@ class ChatPage(QWidget):
     def load_demo_data(self):
         now = datetime.now()
         today = lambda h, m: now.replace(hour=h, minute=m, second=0, microsecond=0)
-        self.set_user_style("Sainen420", WHITE, BLACK)
-        self.set_user_style("lztech", BLACK, BLUE)
-        self.set_user_style("GreatGodChal...", WHITE, RED)
-        self.set_user_style("moss", BLUE, BLACK)
+        self.set_user_style("Sainen420", BLACK, WHITE)
+        self.set_user_style("lztech", "#DDAACC", "#22282A")
+        self.set_user_style("GreatGodChalkp", WHITE, BLACK)
+        self.set_user_style("moss", "#A6E231", "#2D4007")
         self.set_profile("Sainen420")
         self.set_chats([
             {"chat_id": 1, "name": "RECONSTRUCTION 3, 2, 1", "unread": 0, "last_activity": today(11, 29)},
             {"chat_id": 2, "name": "Purgatory", "unread": 66, "last_activity": today(3, 33)},
-            {"chat_id": 3, "name": "gng this group got...", "unread": 5, "last_activity": datetime(2026, 10, 25)},
+            {"chat_id": 3, "name": "gng this group got leaked NO ONE MESSAGE HERE", "unread": 5, "last_activity": datetime(2026, 10, 25)},
             {"chat_id": 4, "name": "lztech", "unread": 0, "is_dm": True, "last_activity": datetime(2026, 10, 15)},
-            {"chat_id": 5, "name": "GreatGodChal...", "unread": 0, "is_dm": True, "last_activity": datetime(2026, 5, 9)},
+            {"chat_id": 5, "name": "GreatGodChalkp", "unread": 0, "is_dm": True, "last_activity": datetime(2026, 5, 9)},
             {"chat_id": 6, "name": "Study Circle", "pending": True},
         ], selected_id=1)
         self.set_members([
             {"username": "Sainen420", "online": True},
             {"username": "lztech", "online": True},
-            {"username": "GreatGodChal...", "online": True},
+            {"username": "GreatGodChalkp", "online": True},
             {"username": "moss", "online": False},
         ])
         d = datetime(2026, 11, 2)
         self.set_messages([
+            {"id": 0, "sender": "lztech", "time": d.replace(hour=11, minute=20),
+            "text": "first"},
             {"id": 1, "sender": "lztech", "time": d.replace(hour=11, minute=24),
              "text": "Starting fresh in here. What should we rebuild first?"},
-            {"id": 2, "sender": "GreatGodChal...", "time": d.replace(hour=11, minute=25),
+            {"id": 2, "sender": "GreatGodChalkp", "time": d.replace(hour=11, minute=25),
              "text": "The **welcome space**. One place for links and a short intro."},
             {"id": 3, "sender": "moss", "time": d.replace(hour=11, minute=26),
              "text": "Yes. Keep the old archive, but make the new rooms *easier* to find."},
+            {"id": 3, "sender": "moss", "time": d.replace(hour=11, minute=27),
+             "text": "Hmmm... The thing can get quite long.\n__This is a LONG MESSAGE__\nThe EoDGram™ Pacer Test is a multistage elemental capacity test that progressively gets more difficult as it continues. The 5 elements pacer test will begin in 30 seconds. Line up at the play channel. The creation speed starts slowly, but gets faster each minute after you hear this signal. [beep] A single set should be completed each time you hear this sound. [ding] Remember to make elements as fast as possible. The second time you fail to complete a set before the sound, your test is over. The test will begin on the word start. On your mark, get ready, start."},
             {"id": 4, "sender": "lztech", "time": d.replace(hour=11, minute=28),
              "text": "I'll sort the links. Can someone draft the __welcome note__?"},
             {"id": 5, "sender": "Sainen420", "own": True, "status": "Sent", "time": d.replace(hour=11, minute=29),
@@ -1408,7 +1422,7 @@ class ChatPage(QWidget):
         self.set_summary("This conversation seems to be relating to setting up the group chat.\n"
                          "Lztech seems to be coordinating the setup of this group chat.")
 
-
+# if this application is the main, then it's run in TEST mode
 if __name__ == "__main__":
     import sys
     from PySide6.QtWidgets import QApplication
@@ -1428,7 +1442,7 @@ if __name__ == "__main__":
             QTimer.singleShot(600, lambda: self.resolve_invite(chat_id, False))
 
         def request_invitees(self, chat_id, query):
-            people = ["lztech", "moss", "GreatGodChal..."]
+            people = ["lztech", "moss", "GreatGodChalkp"]
             hit = [{"user_id": n, "username": n} for n in people if query.lower() in n.lower()]
             QTimer.singleShot(300, lambda: self.set_invitees(chat_id, query, hit))
 
