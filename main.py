@@ -70,31 +70,68 @@ class MainWindow(QMainWindow):
         self.network.error.connect(self.handle_connection_error)
         self.network.connection_status.connect(self.handle_connection_result)
         self.chat_page.request.connect(self.handle_request)
+        self.chat_page.session_ended.connect(self.handle_session_ended)
+        self.chat_page.logout_requested.connect(self.do_logout)
 
         self.worker = None
+
+    # session storage
+    @property
+    def cur_user(self):
+        return RequestCord.auth_user()
+    @cur_user.setter
+    def cur_user(self, value):
+        RequestCord.set_auth(value, RequestCord.auth_session())
+    @property
+    def cur_session(self):
+        return RequestCord.auth_session()
+    @cur_session.setter
+    def cur_session(self, value):
+        RequestCord.set_auth(RequestCord.auth_user(), value)
+    def set_session(self, user_id, session_token):
+        """Store both at once (the login flow calls this with the login reply's user_id / session_token)."""
+        RequestCord.set_auth(str(user_id), str(session_token))
+    def clear_session(self):
+        RequestCord.clear_auth()
+    def make_request(self, method, url, data=None):
+        """Request factory: a RequestCord carrying the stored session."""
+        return RequestCord.from_dict(method, url, data)
 
     # screen swapping
     def show_chat_page(self, username):
         self.chat_page.set_profile(username)
         self.stacked_widget.setCurrentWidget(self.chat_page)
+        self.chat_page.load_initial()
+    def show_login_page(self, message=None, success=False):
+        """Back to the login page; the socket is left as it is."""
+        self.pending = None
+        self.clear_session()
+        self.chat_page.reset()
+        self.login_page.reset_form()
+        self.stacked_widget.setCurrentWidget(self.login_page)
+        if message:
+            self.login_page.set_status(message, success)
+    @Slot(str)
+    def handle_session_ended(self, message):
+        """The chat page says the server ended this session (251 / event/session_revoked)."""
+        self.show_login_page(message, False)
 
     # the great ROUTER
     @Slot(int, object)
     def handle_reply(self, status_code, data_obj):
-        path = ''
-        if 'path' in data_obj:
-            path = data_obj['path']
-            del data_obj['path']
+        if not isinstance(data_obj, dict):
+            return
+        path = str(data_obj.get('path', '')).strip('/')
         # if path explicitly specifies a module, then route to that module
         path_spl = path.split('/')
         if path_spl[0].lower() == 'login':
             self.login_page.router(status_code,'/'.join(path_spl[1:]),data_obj)
-            if path_spl[1].lower() == 'success':
-                self.cur_session = data_obj['session_token']
-                self.cur_user = data_obj['user_id']
-            elif path_spl[1].lower() == 'logout':
-                self.cur_session = ''
-                self.cur_user = ''
+            sub = path_spl[1].lower() if len(path_spl) > 1 else ''
+            if sub == 'success':
+                self.cur_session = data_obj.get('session_token', '')
+                self.cur_user = data_obj.get('user_id', '')
+            elif sub == 'logout':
+                self.clear_session()
         else:
             # by default, we yeet it into chat page
             self.chat_page.router(status_code,'/'.join(path_spl[1:]),data_obj)
@@ -102,6 +139,21 @@ class MainWindow(QMainWindow):
     @Slot(RequestCord)
     def handle_request(self, request):
         net = self.network
+        if not isinstance(request, RequestCord):
+            return
+        if not request.has_credentials():
+            request.stamp_auth()
+        if not request.has_credentials():
+            self.show_login_page("You are not logged in.", False)
+            return
+        if not (net.connected and net.running):
+            self.show_login_page("Connection lost. Please log in again.", False)
+            return
+        if not net.send(request):
+            # send() already said why through the error signal. If the socket is still up the
+            # request itself was bad: tell the chat page so nothing waits for a reply forever.
+            if net.connected and net.running:
+                self.chat_page.request_rejected(request, "The request could not be sent.")
     # request factory
     @Slot(str, int, str, str)
     def do_signin(self, ip, port, username, password):
@@ -113,13 +165,12 @@ class MainWindow(QMainWindow):
     @Slot()
     def do_logout(self):
         # banish back to login page
-        self.pending = None
-        RequestCord.clear_auth()
-        self.network.disconnect()
-        self.network.wait()
-        self.chat_page.reset()
-        self.login_page.reset_form()
-        self.stacked_widget.setCurrentWidget(self.login_page)
+        net = self.network
+        if RequestCord.has_auth() and net.connected and net.running:
+            net.send(self.make_request(POST_MTDC, 'users/logout'))
+        net.disconnect()
+        net.wait()
+        self.show_login_page()
 
     # sending without knowing there might be a connection
     def _login_page_send(self, cmd, ip, port, username, password):
@@ -161,6 +212,10 @@ class MainWindow(QMainWindow):
                 self._flush_pending()
             return
         if message == "Disconnected":
+            return
+        if self.stacked_widget.currentWidget() is self.chat_page:
+            # the socket died while chatting: nothing can be sent any more
+            self.show_login_page(f"Connection lost ({message}). Please log in again.", False)
             return
         if self.pending is not None:
             text = f"Can't connect to {self.network.host}:{self.network.port} ({message})"

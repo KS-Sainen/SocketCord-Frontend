@@ -72,12 +72,26 @@ class RequestCord:
     # auth setter - let's set both at the same time
     @classmethod
     def set_auth(cls, user_id, ses_token):
-        uid = cls._as_uuid(user_id, "user_id")
-        tok = cls._as_uuid(ses_token, "ses_token")
+        uid = NIL_UUID if user_id in ('', None) else cls._as_uuid(user_id, "user_id")
+        tok = NIL_UUID if ses_token in ('', None) else cls._as_uuid(ses_token, "ses_token")
         cls._auth = (uid, tok)
     @classmethod
     def clear_auth(cls):
         cls._auth = (NIL_UUID, NIL_UUID)
+    @classmethod
+    def has_auth(cls):
+        return cls._auth[0] != NIL_UUID and cls._auth[1] != NIL_UUID
+    @classmethod
+    def auth_user(cls):
+        """Current user_id as a string ('' when logged out)."""
+        return str(cls._auth[0]) if cls._auth[0] != NIL_UUID else ''
+    @classmethod
+    def auth_session(cls):
+        """Current session_token as a string ('' when logged out)."""
+        return str(cls._auth[1]) if cls._auth[1] != NIL_UUID else ''
+    # does this request already carry credentials?
+    def has_credentials(self):
+        return self.user_id != NIL_UUID and self.ses_token != NIL_UUID
     # UUID
     @staticmethod
     def _as_uuid(value, name):
