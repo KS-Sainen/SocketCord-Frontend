@@ -678,6 +678,7 @@ class ChatPage(QWidget):
         header_row.addWidget(self.chat_title, 1)
         self.add_people_btn = self._icon_button("people_plus", WHITE, "Add people to group", 30)
         header_row.addWidget(self.add_people_btn)
+        self.add_people_btn.hide()          # invitations are off: people join groups only by themselves (R10)
         chat_layout.addWidget(header)
 
         self.chat_frame = chat_frame
@@ -1376,7 +1377,9 @@ class ChatPage(QWidget):
             self.set_chat_unread(chat_id, int(chat.get("unread", 0) or 0), when)
 
     def _apply_chat_list(self, chats_reply):
-        rows = [_chat_row(c) for c in chats_reply.get("chats", [])]
+        # invitations are off (R10): a pending invitation from an older version is not listed;
+        # the group still shows in Browse Groups, where JOIN works as usual
+        rows = [_chat_row(c) for c in chats_reply.get("chats", []) if not c.get("pending")]
         rows.sort(key=lambda c: c.get("last_activity") or datetime.min, reverse=True)
         self.set_chats(rows, selected_id=self._chat_id)
         if self.chat_list.count() == 0:
@@ -1552,7 +1555,7 @@ class ChatPage(QWidget):
     def _build_member_menu(self, username):
         """Group: Invite to group + Message.  DM: Invite to group only."""
         menu = QMenu(self.members_list)
-        menu.addAction("Invite to group").triggered.connect(lambda: self.invite_member(username))
+        # "Invite to group" is off: people join groups only by themselves, with Browse Groups -> JOIN (R10)
         if not self._chat_is_dm():
             menu.addAction("Message").triggered.connect(lambda: self.message_member(username))
         menu.addAction("See Groups").triggered.connect(lambda: self.see_groups(username))
@@ -1825,7 +1828,7 @@ class ChatPage(QWidget):
         self._pending = False
         self._invite_busy = False
         self.chat_stack.setCurrentIndex(0)
-        self.add_people_btn.show()
+        self.add_people_btn.hide()
         self.chat_list.blockSignals(True)
         self.chat_list.clear()
         self.chat_list.blockSignals(False)
@@ -1890,7 +1893,7 @@ class ChatPage(QWidget):
         self.chat_title.setText(("[DM] " if chat.get("is_dm") else "") + str(chat.get("name", "")))
         if pending:
             self.invite_text.setText(f"You've been invited to join the group {chat.get('name', '')}")
-        self.add_people_btn.setVisible(not pending and not chat.get("is_dm"))   # groups only
+        self.add_people_btn.setVisible(False)   # groups only; invitations are off now (R10)
         self._sync_summary_button()                  # stays off while this chat's summary is made
         if changed:                                  # nothing of the previous chat may linger
             self.chat_stack.setCurrentIndex(1 if pending else 0)
