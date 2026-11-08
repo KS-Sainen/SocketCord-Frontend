@@ -72,6 +72,9 @@ def search_icon(color):
     return QIcon(px)
 
 
+# ---------------------------------------------------------------------------------------
+# small widgets
+# ---------------------------------------------------------------------------------------
 class ErrorLabel(QLabel):
     """One-line red message after a field label. Long messages are cut with '...'
     (the full text stays in the tooltip) so they can never widen the dialog."""
@@ -195,6 +198,9 @@ class GroupComboBox(QComboBox):
                                  QPointF(c.x(), c.y() + 5)]))
 
 
+# ---------------------------------------------------------------------------------------
+# styling
+# ---------------------------------------------------------------------------------------
 _DIALOG_QSS = Template("""
 QDialog#FormDialog { background-color: $white; }
 QFrame#DialogFrame { background-color: $white; border: 4px solid $black; }
@@ -271,6 +277,9 @@ QPushButton#DialogButton[status="processing"] { background-color: $white; color:
 """).substitute(PALETTE)
 
 
+# ---------------------------------------------------------------------------------------
+# base form
+# ---------------------------------------------------------------------------------------
 class FormDialog(QDialog):
     """Title, labelled fields, CANCEL / SAVE. Subclasses add fields and implement collect()."""
     submitted = Signal(dict)
@@ -320,6 +329,7 @@ class FormDialog(QDialog):
         self.cancel_btn.clicked.connect(self.reject)
         self.submit_btn.clicked.connect(self.submit)
 
+    # ------------------------------------------------------------------ building
     @staticmethod
     def line_edit(text="", password=False, read_only=False, placeholder=""):
         edit = QLineEdit(text)
@@ -352,6 +362,7 @@ class FormDialog(QDialog):
         self._rows[key] = (widget, err)
         return widget
 
+    # ------------------------------------------------------------------ validation
     def collect(self):
         """-> (values dict, errors {key: message}). Subclasses override."""
         return {}, {}
@@ -407,6 +418,9 @@ class FormDialog(QDialog):
             self.status_label.show()
 
 
+# ---------------------------------------------------------------------------------------
+# the forms
+# ---------------------------------------------------------------------------------------
 class EditProfileDialog(FormDialog):
     def __init__(self, username, text_color, background, parent=None):
         super().__init__("Edit profile", parent)
@@ -536,6 +550,8 @@ class GroupsDialog(FormDialog):
 
 
 # "Invite people": search the people who can be invited, pick one
+# ---------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------
 class _SearchEdit(QLineEdit):
     entered = Signal()
 

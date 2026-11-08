@@ -21,6 +21,9 @@ from dialogs import (
 )
 from api import GET, POST, PATCH, ApiError
 
+# ---------------------------------------------------------------------------------------
+# constants
+# ---------------------------------------------------------------------------------------
 TAB_WIDTH = 165                 # the black "DIRECTORY / CHAT / ..." tabs
 TAB_HEIGHT = 36
 INPUT_PLACEHOLDER = "Anything else for the welcome note?"
@@ -42,7 +45,9 @@ SUMMARY_COUNT = 50              # messages the summary covers
 GROUP_PAGE = 200                # groups per GET chats/groups page (the backend's maximum)
 SYSTEM_SENDER = "[System]"      # '[' can't appear in a username, so no user can look like this
 
-DF_USER_STYLE = (BLACK, WHITE)  # (text colour, background) of a user whose own are unknown
+# (text colour, background)
+# default color style
+DF_USER_STYLE = (BLACK, WHITE)
 
 def activity_color(selected, unread):
     """Colour of the '(n) - time' line under a chat's name.
@@ -52,7 +57,9 @@ def activity_color(selected, unread):
     return BLUE if unread else BLACK
 
 
+# ---------------------------------------------------------------------------------------
 # message text: **bold**  *italic* / _italic_  __underline__   (can be nested)
+# ---------------------------------------------------------------------------------------
 _RX_BOLD_ITALIC = re.compile(r'\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*', re.S)
 _RX_BOLD = re.compile(r'\*\*(?=\S)(.+?)(?<=\S)\*\*', re.S)
 _RX_UNDERLINE = re.compile(r'__(?=\S)(.+?)(?<=\S)__', re.S)
@@ -75,6 +82,9 @@ def markdown_to_html(text):
     return f"<span style='white-space: pre-wrap;'>{s}</span>"
 
 
+# ---------------------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------------------
 def _as_datetime(value):
     """A backend timestamp ("2026-11-02T04:24:00+00:00") as a naive local datetime, which is what
     the clock, the day dividers and the directory's sort order work with."""
@@ -182,6 +192,9 @@ def _repolish(widget, name, value):
     style.polish(widget)
 
 
+# ---------------------------------------------------------------------------------------
+# widgets
+# ---------------------------------------------------------------------------------------
 class ElidedLabel(QLabel):
     """A one-line label that shows '...' instead of forcing its parent wider. Plain text only:
     it shows names other users chose (a group called '<b>x</b>' must not turn bold)."""
@@ -329,7 +342,9 @@ class AutoGrowTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
-# The list delegates paint rows directly, which stays cheap with hundreds of chats / members.
+# ---------------------------------------------------------------------------------------
+# list delegates (paint rows directly: cheap with hundreds of chats / members)
+# ---------------------------------------------------------------------------------------
 class ChatListDelegate(QStyledItemDelegate):
     ROW_H = 62
     PAD = 12
@@ -419,6 +434,9 @@ class MemberListDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+# ---------------------------------------------------------------------------------------
+# styling (palette tokens only)
+# ---------------------------------------------------------------------------------------
 _CHAT_QSS = Template("""
 /* black tabs sitting on the top-left corner of every panel */
 QFrame#PanelTag { background-color: $black; }
@@ -493,6 +511,9 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background-color:
 """).substitute(PALETTE, border=INPUT_BORDER, pad=INPUT_PAD_Y)
 
 
+# ---------------------------------------------------------------------------------------
+# the page
+# ---------------------------------------------------------------------------------------
 class ChatPage(QWidget):
     logout_requested = Signal()             # main.py: disconnect the socket, back to the login page
 
@@ -522,7 +543,7 @@ class ChatPage(QWidget):
         self.session = None                 # main.Session while logged in
         self._gen = 0                       # bumps on reset: replies for an older session are dropped
         self._my_id = None                  # current user's user_id
-        self._loading_chat = None           # chat whose messages are on their way
+        self._loading_chat = None           # chat whose info / messages are on their way
         self._load_seq = 0                  # bumps on every select_chat: replies of an older load are dropped
         self._early = {}                    # chat_id -> pushes that arrived while its messages loaded
         self._refreshing = False            # GET chats in flight
@@ -541,6 +562,7 @@ class ChatPage(QWidget):
         self._notice_timer.setSingleShot(True)
         self._notice_timer.timeout.connect(lambda: self.hint_label.setText(self._hint_text))
 
+    # ------------------------------------------------------------------ building the UI
     def _make_tab(self, text, button=None):
         tab = QFrame()
         tab.setObjectName("PanelTag")
@@ -581,6 +603,7 @@ class ChatPage(QWidget):
         main_layout.setSpacing(12)
 
         # 1. DIRECTORY (left)
+        # ================= 1. DIRECTORY (left) =================
         dir_frame = QFrame()
         dir_frame.setObjectName("PanelFrame")
         dir_layout = QVBoxLayout(dir_frame)
@@ -639,6 +662,7 @@ class ChatPage(QWidget):
         left = self._column(self._make_tab("DIRECTORY"), dir_frame)
 
         # 2. CHAT (center)
+        # ================= 2. CHAT (center) =================
         chat_frame = QFrame()
         chat_frame.setObjectName("PanelFrame")
         chat_layout = QVBoxLayout(chat_frame)
@@ -735,6 +759,7 @@ class ChatPage(QWidget):
         center = self._column(self._make_tab("CHAT"), chat_frame)
 
         # 3. MEMBERS + SUMMARY (right)
+        # ================= 3. MEMBERS + SUMMARY (right) =================
         members_frame = QFrame()
         members_frame.setObjectName("PanelFrame")
         members_layout = QVBoxLayout(members_frame)
@@ -800,6 +825,7 @@ class ChatPage(QWidget):
         main_layout.addLayout(center, 48)
         main_layout.addLayout(right, 21)
 
+        # ================= interactions -> dummy functions =================
         self.edit_profile_btn.clicked.connect(self.edit_profile)
         self.logout_btn.clicked.connect(self.logout)
         self.change_password_btn.clicked.connect(self.change_password)
@@ -816,6 +842,9 @@ class ChatPage(QWidget):
 
     # The buttons open pop-ups (dialogs.py). A pop-up's SAVE button calls one of the request_*
     # methods below; the backend's answer is reported with finish_dialog().
+    # ------------------------------------------------------------------ buttons
+    # The buttons open pop-ups (dialogs.py). A pop-up's SAVE button calls one of the dummy
+    # request_* functions below; the backend's answer is reported with finish_dialog().
     def edit_profile(self):
         """Edit profile button -> pop-up with the user's name and colours."""
         fg, bg = self.user_style(self._me)
@@ -854,6 +883,7 @@ class ChatPage(QWidget):
                 self.request_group_members(self._chat_id)
         self._sync_members_view()
 
+    # Generate button next to SUMMARY. -> ask the backend for a summary of the selected chat. When the reply arrives call set_summary(text).
     def generate_summary(self):
         """Generate button next to SUMMARY. -> GET chat/{chat_id}/summary {mode, count}
         (an AI summary of the latest messages; it can take a few seconds) -> set_summary(text).
@@ -877,6 +907,7 @@ class ChatPage(QWidget):
                 self.set_summary(text)
                 self._sync_summary_button()
 
+        # GET chat/{chat_id}/summary: the newest 50 messages (the server may take a while)
         self._call(GET, f"chat/{chat_id}/summary", {"mode": "recent", "count": SUMMARY_COUNT},
                    lambda data: finished(data.get("summary") or "Nothing to summarize yet."),
                    lambda err: finished(f"Couldn't generate a summary: {err.message}"),
@@ -907,6 +938,7 @@ class ChatPage(QWidget):
         if d is not None and self._dialog_kind == "add_people" and d.chat_id == chat_id:
             d.set_users(query, users)
 
+    # Send button / Enter in the chat box. -> POST /chat/{chat_id}/message Read the text with message_text(); call clear_input() once the backend accepted it.
     def send_message(self):
         """Send button / Enter in the chat box. -> POST chat/{chat_id}/message {content}
         The backend takes "content" or "text" on the way in and spells it "text" in the message
@@ -937,6 +969,7 @@ class ChatPage(QWidget):
 
         self._call(POST, f"chat/{chat_id}/message", {"content": text}, sent, failed)
 
+    # A chat was clicked in the directory. -> GET /chat/{chat_id}/info and /messages, then feed set_members(..., chat_id), set_messages(..., chat_id=chat_id).
     def select_chat(self, chat_id):
         """A chat was clicked in the directory. -> GET chat/{chat_id}/info and chat/{chat_id}/messages,
         then set_members(..., chat_id), set_messages(..., chat_id=chat_id). When the first unread
@@ -956,7 +989,7 @@ class ChatPage(QWidget):
         token = self._load_seq
         self._loading_chat = chat_id
         self._early[chat_id] = []
-        self.request_group_members(chat_id)
+        self.request_group_members(chat_id)  # GET chat/{id}/info
         st = {"rows": [], "first": None, "older": 0}    # rows loaded so far (oldest first)
 
         def current():
@@ -1044,6 +1077,7 @@ class ChatPage(QWidget):
                    lambda err: self._finish_for(dialog, False, err.message,
                                                 "new_password" if err.field == "new_password" else None))
 
+    # POST chats {name}
     def request_new_group(self, name):
         """POST chats {name} -> the directory is refreshed and the new group opens."""
         dialog = self._dialog
@@ -1092,6 +1126,7 @@ class ChatPage(QWidget):
         self._call(POST, f"chat/{chat_id}/join", None, joined,
                    lambda err: self._finish_for(dialog, False, err.message))
 
+    # POST chat/{chat_id}/invite {user_id}
     def request_invite(self, username, chat_id, user_id=None):
         """POST chat/{chat_id}/invite  {user_id}
         user_id is known when the user was picked in the Invite people pop-up; from the right-click
@@ -1125,6 +1160,7 @@ class ChatPage(QWidget):
 
         self._call(GET, f"chat/{chat_id}/invitees", {"query": query}, found, failed)
 
+    # POST users/{user_id}/dm {message}
     def request_message(self, username, greeting):
         """POST users/{user_id}/dm  {message: greeting}. The backend opens the DM at once (or reuses
         the existing one) and the client switches to it."""
@@ -1175,6 +1211,7 @@ class ChatPage(QWidget):
                    lambda data: self.resolve_invite(chat_id, False),
                    lambda err: self.invite_failed(chat_id, err.message))
 
+    # GET chat/{chat_id}/info -> set_members
     def request_group_members(self, chat_id):
         """GET chat/{chat_id}/info -> set_members(members, chat_id)"""
         def got(data):
@@ -1186,6 +1223,7 @@ class ChatPage(QWidget):
                    lambda err: chat_id == self._chat_id and self.show_notice(
                        f"Couldn't load the members: {err.message}"))
 
+    # GET users/online -> set_online_users
     def request_online_users(self):
         """GET users/online -> set_online_users(users)"""
         def got(data):
@@ -1195,6 +1233,7 @@ class ChatPage(QWidget):
 
         self._call(GET, "users/online", None, got)
 
+    # POST chat/{chat_id}/read {message_id: newest message shown}
     def request_mark_read(self, chat_id, message_id):
         """The user is at the bottom of the chat: POST chat/{chat_id}/read {message_id: newest shown}."""
         def failed(err):
@@ -1431,7 +1470,7 @@ class ChatPage(QWidget):
             self.refresh_chats(then=self._refresh_browse)   # a chat this list does not have yet
             return
         if chat_id == self._chat_id and not self._pending:
-            self.request_group_members(chat_id)
+            self.request_group_members(chat_id)  # somebody came or went: refresh the member list
         self.refresh_chats(then=self._refresh_browse)
 
     def _on_group_deleted(self, data):
@@ -1447,6 +1486,7 @@ class ChatPage(QWidget):
         if self._dialog is not None and self._dialog_kind == "browse":
             self.request_all_groups()
 
+    # ------------------------------------------------------------------ pop-ups
     def _open_dialog(self, kind, dialog, request):
         if self._dialog is not None:
             dialog.deleteLater()
@@ -1497,6 +1537,7 @@ class ChatPage(QWidget):
         self._me = new
         self.set_user_style(new, values["text_color"], values["background"])
 
+    # ------------------------------------------------------------------ member right-click
     def _chat_data(self, chat_id):
         for i in range(self.chat_list.count()):
             chat = self.chat_list.item(i).data(Qt.UserRole) or {}
@@ -1573,6 +1614,7 @@ class ChatPage(QWidget):
         self._open_dialog("message", MessageDialog(username, self), self.request_message)
 
     # called by main.py and by the request_* replies
+    # ------------------------------------------------------------------ data in (called by main.py)
     def message_text(self):
         return self.msg_input.toPlainText().strip()
 
@@ -1701,6 +1743,7 @@ class ChatPage(QWidget):
                 return
 
     # invitations ([Pending] chats)
+    # ---- invitations ([Pending] chats)
     def accept_invite(self):
         self._answer_invite(True)
 
@@ -1794,6 +1837,7 @@ class ChatPage(QWidget):
         self.summary_text.clear()
         self.msg_input.clear()
 
+    # ------------------------------------------------------------------ internals
     def _sync_input_gap(self):
         """Blank strip above the chat box (messages are cut off at its top edge). It is as tall as
         the distance from the chat box's bottom edge to the frame: hint line + spacing + margin."""
@@ -1930,6 +1974,7 @@ class ChatPage(QWidget):
                 self.message_scroll.verticalScrollBar().setValue(max(0, marker.y() - 8))
         self._maybe_mark_read()
 
+    # Notifications are cleared once the user is at the bottom of the loaded chat.
     def _maybe_mark_read(self, at_bottom=None):
         """At the bottom of the loaded chat everything is read: its count goes to 0, and the server
         hears about the newest message once. That is decided by the message, not by the count, which
@@ -1959,6 +2004,7 @@ class ChatPage(QWidget):
             self._maybe_mark_read()
 
     # preview only
+    # ------------------------------------------------------------------ demo data (preview only)
     def load_demo_data(self):
         now = datetime.now()
         today = lambda h, m: now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -1998,6 +2044,7 @@ class ChatPage(QWidget):
                          "Lztech seems to be coordinating the setup of this group chat.")
 
 
+# if this application is the main, then it's run in TEST mode
 if __name__ == "__main__":
     import sys
     from PySide6.QtWidgets import QApplication

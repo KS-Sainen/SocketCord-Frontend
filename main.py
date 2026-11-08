@@ -21,6 +21,7 @@ REVOKED_TEXT = {
 }
 
 
+# session storage
 class Session:
     """The logged-in account: the two ids that go into every RequestCord header."""
 
@@ -29,16 +30,20 @@ class Session:
         self.token = str(token)
 
 
+# font loader
 def load_fonts():
+    # pathing
     base_dir = Path(__file__).resolve().parent
     font_path_main = base_dir / "fonts" / "SourceSans3-VariableFont_wght.ttf"
     font_path_italic = base_dir / "fonts" / "SourceSans3-Italic-VariableFont_wght.ttf"
+    # register it all
     if not font_path_main.exists():
         print(f"Default font file missing at {font_path_main}. This is very sad.")
     if not font_path_italic.exists():
         print(f"Italic font file missing at {font_path_italic}. This is very sad.")
 
     font_id = QFontDatabase.addApplicationFont(str(font_path_main))
+    # print(font_id)
     if font_id == -1:
         print(f"Failed to load font binary from {font_path_main}. This is very sad.")
     else:
@@ -50,23 +55,28 @@ def load_fonts():
 
 
 class MainWindow(QMainWindow):
+    # comes in as a string, comes out as a string always
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SocketCord")
         self.resize(900, 640)
 
+        # load fonts
         load_fonts()
+        # Apply global QSS stylesheet
         self.setStyleSheet(APP_STYLESHEET)
 
+        # Networking Manager
         self.network = SocketCordNetwork('127.0.0.1', 8080)
         self.api = Api(self.network)            # rid -> callback matching, server pushes
         self.side = SideChannel(self.network)   # second connection for the slow AI summary
-        self.pending = None                     # a sign-up / login waiting for the socket to open
+        self.pending = None # pending req due to turned off socket
         self.session = None
         self._attempt = 0                       # bumps on every login / sign-up / logout: late replies are ignored
         self._auth_busy = False                 # a sign-up / login is on its way
 
-        self.stacked_widget = QStackedWidget()  # index 0: login, index 1: chat
+        # Screen management stack (Index 0: Login, Index 1: Chat)
+        self.stacked_widget = QStackedWidget()
         self.setCentralWidget(self.stacked_widget)
 
         self.login_page = LoginPage()
@@ -76,6 +86,7 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.login_page)
         self.stacked_widget.addWidget(self.chat_page)
 
+        # Connect signals
         self.login_page.login_requested.connect(self.do_signin)
         self.login_page.signup_requested.connect(self.do_signup)
         self.chat_page.logout_requested.connect(self.do_logout)
@@ -87,27 +98,32 @@ class MainWindow(QMainWindow):
 
         self.worker = None
 
+    # screen swapping
     def show_chat_page(self, user):
         self.chat_page.start_session(user, self.session)
         self.stacked_widget.setCurrentWidget(self.chat_page)
 
     # every reply and push goes through the dispatcher (api.py), which hands it to the callback
     # of the request with the same "rid", or to the push handlers
+    # the great ROUTER
     @Slot(int, object)
     def handle_reply(self, status_code, data_obj):
         self.api.handle_reply(status_code, data_obj)
 
+    # request factory
     @Slot(str, int, str, str)
     def do_signin(self, ip, port, username, password):
         self._login_page_send('login', ip, port, username, password)
 
     @Slot(str, int, str, str)
     def do_signup(self, ip, port, username, password):
+        # Placeholder sign up routing to same connection skeleton
         self._login_page_send('signup', ip, port, username, password)
 
     @Slot()
     def do_logout(self):
         """Log out button: POST users/logout, then disconnect and show the login page."""
+        # banish back to login page
         if self.session is None:
             self._end_session()
             return
@@ -137,6 +153,7 @@ class MainWindow(QMainWindow):
             self.login_page.set_status(message, False)
         self.stacked_widget.setCurrentWidget(self.login_page)
 
+    # sending without knowing there might be a connection
     def _login_page_send(self, cmd, ip, port, username, password):
         """LOG IN / SIGN UP, whether or not the socket is open yet."""
         net = self.network
@@ -153,6 +170,7 @@ class MainWindow(QMainWindow):
                 return
             net.disconnect()
             net.wait()
+        # conf failed
         if not net.conf(ip, port):
             return
         net.open_connection()
@@ -214,6 +232,7 @@ class MainWindow(QMainWindow):
         if self.session is not None:
             self._end_session(f"{message}")
 
+    # connection handlers
     @Slot(str)
     def handle_connection_error(self, details):
         if self.session is not None:

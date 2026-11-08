@@ -13,11 +13,9 @@ import traceback
 from PySide6.QtCore import QObject, Signal, Slot
 
 from models import NIL_UUID, RequestCord
-from network import SocketCordNetwork
+from network import SocketCordNetwork, POST_MTDC, GET_MTDC, PATCH_MTDC
 
-POST = 112233445
-GET = 354984100
-PATCH = 943742156
+POST, GET, PATCH = POST_MTDC, GET_MTDC, PATCH_MTDC
 
 STATUS_NAMES = {250: "Bad request", 251: "Unauthorized", 252: "Forbidden", 253: "Not found",
                 254: "Server error"}
