@@ -1,9 +1,8 @@
 import html
-import json
 import re
 import uuid
 import zlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from string import Template
 
 from PySide6.QtCore import Qt, Signal, QSize, QRect, QPointF, QTimer, QEvent
@@ -15,17 +14,13 @@ from PySide6.QtWidgets import (
 )
 
 # Palette tokens come from styles.py. Never write a hex colour in this file.
-from models import RequestCord
-from network import POST_MTDC, GET_MTDC, PATCH_MTDC
 from styles import BLACK, WHITE, RED, BLUE, PALETTE
 from dialogs import (
     EditProfileDialog, ChangePasswordDialog, NewGroupDialog, InviteDialog, MessageDialog, GroupsDialog,
-    AddPeopleDialog
+    AddPeopleDialog, BrowseGroupsDialog
 )
+from api import GET, POST, PATCH, ApiError
 
-# ---------------------------------------------------------------------------------------
-# constants
-# ---------------------------------------------------------------------------------------
 TAB_WIDTH = 165                 # the black "DIRECTORY / CHAT / ..." tabs
 TAB_HEIGHT = 36
 INPUT_PLACEHOLDER = "Anything else for the welcome note?"
@@ -38,11 +33,16 @@ ENTRY_MARGIN_BOTTOM = 6         # px under the hint line; the blank strip above 
                                 # whole distance from the input's bottom edge to the frame
 PENDING_TEXT = "[Pending]"        # shown in the directory instead of the unread count
 MEMBERS, ONLINE = "members", "online"   # what the right-hand list shows
-HINT_TEXT = "Enter to send · Shift + Enter for a new line"
+MESSAGE_PAGE = 100              # messages loaded when a chat opens (the backend allows up to 200)
+OLDER_PAGE = 200                # ... plus older pages of this size while the first unread one is not in
+OLDER_PAGES_MAX = 5             # (at most 1100 messages; beyond that NEW goes above the oldest one shown)
+MESSAGE_MAX_LEN = 4000          # the backend refuses longer messages
+NOTICE_MS = 6000                # how long an error replaces the hint under the chat box
+SUMMARY_COUNT = 50              # messages the summary covers
+GROUP_PAGE = 200                # groups per GET chats/groups page (the backend's maximum)
+SYSTEM_SENDER = "[System]"      # '[' can't appear in a username, so no user can look like this
 
-# (text colour, background)
-# default color style
-DF_USER_STYLE = (BLACK, WHITE)
+DF_USER_STYLE = (BLACK, WHITE)  # (text colour, background) of a user whose own are unknown
 
 def activity_color(selected, unread):
     """Colour of the '(n) - time' line under a chat's name.
@@ -52,9 +52,7 @@ def activity_color(selected, unread):
     return BLUE if unread else BLACK
 
 
-# ---------------------------------------------------------------------------------------
 # message text: **bold**  *italic* / _italic_  __underline__   (can be nested)
-# ---------------------------------------------------------------------------------------
 _RX_BOLD_ITALIC = re.compile(r'\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*', re.S)
 _RX_BOLD = re.compile(r'\*\*(?=\S)(.+?)(?<=\S)\*\*', re.S)
 _RX_UNDERLINE = re.compile(r'__(?=\S)(.+?)(?<=\S)__', re.S)
@@ -77,30 +75,47 @@ def markdown_to_html(text):
     return f"<span style='white-space: pre-wrap;'>{s}</span>"
 
 
-# ---------------------------------------------------------------------------------------
-# small helpers
-# ---------------------------------------------------------------------------------------
-def ts(s):
-    """API timestamp ('2026-11-06T14:11:01.092Z') -> local datetime (None when empty / unreadable)."""
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).astimezone()
-    except ValueError:
-        return None
-
-
 def _as_datetime(value):
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value)
+    """A backend timestamp ("2026-11-02T04:24:00+00:00") as a naive local datetime, which is what
+    the clock, the day dividers and the directory's sort order work with."""
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value)
+            value = datetime.fromisoformat(value)
         except ValueError:
             return None
-    return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value)
+    if not isinstance(value, datetime):
+        return None
+    return value.astimezone().replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+# The backend sends the field names the widgets draw, so these only add what a reply cannot
+# carry: a local datetime, the label for a system line (its sender is null) and "own".
+def _message_row(m, my_id=None):
+    m = m or {}
+    sender_id = m.get("sender_id")
+    return dict(m, sender=str(m.get("sender") or "") or SYSTEM_SENDER,
+                time=_as_datetime(m.get("time")),
+                own=bool(sender_id) and sender_id == my_id)
+
+
+def _chat_row(c):
+    c = c or {}
+    return dict(c, last_activity=_as_datetime(c.get("last_activity")))
+
+
+def _member_row(m, my_id=None):
+    m = m or {}
+    return dict(m, is_me=bool(my_id) and m.get("user_id") == my_id)
+
+
+def _id_before(a, b):
+    """Message ids are UUIDv7: a smaller id is an older message (the backend pages by this order)."""
+    try:
+        return uuid.UUID(str(a)) < uuid.UUID(str(b))
+    except ValueError:
+        return False
 
 
 def format_clock(dt):
@@ -167,14 +182,13 @@ def _repolish(widget, name, value):
     style.polish(widget)
 
 
-# ---------------------------------------------------------------------------------------
-# widgets
-# ---------------------------------------------------------------------------------------
 class ElidedLabel(QLabel):
-    """A one-line label that shows '...' instead of forcing its parent wider."""
+    """A one-line label that shows '...' instead of forcing its parent wider. Plain text only:
+    it shows names other users chose (a group called '<b>x</b>' must not turn bold)."""
     def __init__(self, text="", parent=None):
         super().__init__(parent)
         self._full = text
+        self.setTextFormat(Qt.PlainText)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.setMinimumWidth(0)
         self._apply()
@@ -190,7 +204,8 @@ class ElidedLabel(QLabel):
     def _apply(self):
         elided = self.fontMetrics().elidedText(self._full, Qt.ElideRight, max(0, self.width()))
         QLabel.setText(self, elided)
-        self.setToolTip(self._full if elided != self._full else "")
+        # a tooltip is rich text whenever it looks like markup: escape it inside a real tag
+        self.setToolTip(f"<p>{html.escape(self._full)}</p>" if elided != self._full else "")
 
 
 class UserBadge(QLabel):
@@ -245,7 +260,7 @@ class MessageWidget(QFrame):
 
         head = QHBoxLayout()
         head.setSpacing(8)
-        name = UserBadge(str(msg.get("sender", "?")), fg, bg)
+        name = UserBadge("You" if own else str(msg.get("sender", "?")), fg, bg)
         head.addWidget(name, 0, Qt.AlignLeft)
         head.addStretch(1)
         dt = _as_datetime(msg.get("time"))
@@ -314,9 +329,7 @@ class AutoGrowTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
-# ---------------------------------------------------------------------------------------
-# list delegates (paint rows directly: cheap with hundreds of chats / members)
-# ---------------------------------------------------------------------------------------
+# The list delegates paint rows directly, which stays cheap with hundreds of chats / members.
 class ChatListDelegate(QStyledItemDelegate):
     ROW_H = 62
     PAD = 12
@@ -377,7 +390,8 @@ class MemberListDelegate(QStyledItemDelegate):
         name_font.setPointSizeF(12)
         name_font.setBold(True)
         fm = QFontMetrics(name_font)
-        label = "You" if m.get("is_me") else str(m.get("username", ""))
+        name = str(m.get("username", ""))
+        label = f"{name} (You)" if m.get("is_me") else name
         x0 = rect.left() + self.LEFT + 22
         avail = rect.width() - (x0 - rect.left()) - 10 - 2 * BADGE_PAD_X
         label = fm.elidedText(label, Qt.ElideRight, max(10, avail))
@@ -405,9 +419,6 @@ class MemberListDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-# ---------------------------------------------------------------------------------------
-# styling (palette tokens only)
-# ---------------------------------------------------------------------------------------
 _CHAT_QSS = Template("""
 /* black tabs sitting on the top-left corner of every panel */
 QFrame#PanelTag { background-color: $black; }
@@ -432,8 +443,9 @@ QFrame#ProfileDivider { background-color: $black; border: none; }
 QListWidget#ChatList, QListWidget#MemberList {
     border: none; outline: 0; background-color: $white;
 }
-QPushButton#NewGroupButton { font-size: 14pt; padding: 11px; border: none; }
-QPushButton#NewGroupButton:pressed { background-color: $blue; color: $white; }
+QPushButton#NewGroupButton, QPushButton#BrowseGroupsButton { font-size: 14pt; padding: 11px; border: none; }
+QPushButton#NewGroupButton:pressed, QPushButton#BrowseGroupsButton:pressed { background-color: $blue; color: $white; }
+QPushButton#BrowseGroupsButton { border-bottom: 2px solid $white; }
 
 /* chat panel */
 QFrame#ChatHeader { background-color: $black; }
@@ -481,23 +493,8 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background-color:
 """).substitute(PALETTE, border=INPUT_BORDER, pad=INPUT_PAD_Y)
 
 
-# ---------------------------------------------------------------------------------------
-# the page
-# ---------------------------------------------------------------------------------------
 class ChatPage(QWidget):
     logout_requested = Signal()             # main.py: disconnect the socket, back to the login page
-    request = Signal(RequestCord)           # a request for main.py to send (carries the stored session)
-    session_ended = Signal(str)             # the server ended the session (251 / session_revoked): reason
-
-    # The current user_id / session_token as strings ('' when logged out): the very same storage
-    # main.py uses (RequestCord's stored credentials), so both always agree.
-    @property
-    def cur_user(self):
-        return RequestCord.auth_user()
-
-    @property
-    def cur_session(self):
-        return RequestCord.auth_session()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -519,17 +516,31 @@ class ChatPage(QWidget):
         self._pending = False               # the selected chat is an invitation
         self._invite_busy = False
         self._new_marker = None             # the NEW divider widget
-        self._rid = 0                       # last request id handed out by _send()
-        self._calls = {}                    # rid -> context of a request that waits for its reply
-        self._uids = {}                     # username.lower() -> user_id
-        self._presence_seq = 0
-        self._loading_chat = None           # chat whose info / messages are on their way
-        self._sending = False
-        self._summary_busy = False
+        # backend state (see attach / start_session)
+        self.api = None                     # api.Api, set by main.py
+        self.side = None                    # api.SideChannel: second connection for the summary
+        self.session = None                 # main.Session while logged in
+        self._gen = 0                       # bumps on reset: replies for an older session are dropped
+        self._my_id = None                  # current user's user_id
+        self._loading_chat = None           # chat whose messages are on their way
+        self._load_seq = 0                  # bumps on every select_chat: replies of an older load are dropped
+        self._early = {}                    # chat_id -> pushes that arrived while its messages loaded
+        self._refreshing = False            # GET chats in flight
+        self._refresh_again = False
+        self._after_refresh = []
+        self._summary_chat = None           # chat the summary text belongs to
+        self._summary_seq = 0
+        self._summary_running = None        # _summary_seq of the summary on its way, if any
+        self._read_upto = {}                # chat_id -> newest message the server has as read
+        self._sending = None                # (chat_id, text) of the message on its way
+        self._groups_seq = 0                # bumps on every GET chats/groups: an older answer is dropped
         self.setStyleSheet(_CHAT_QSS)
         self.init_ui()
+        self._hint_text = self.hint_label.text()
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(lambda: self.hint_label.setText(self._hint_text))
 
-    # ------------------------------------------------------------------ building the UI
     def _make_tab(self, text, button=None):
         tab = QFrame()
         tab.setObjectName("PanelTag")
@@ -569,7 +580,7 @@ class ChatPage(QWidget):
         main_layout.setContentsMargins(14, 14, 14, 14)
         main_layout.setSpacing(12)
 
-        # ================= 1. DIRECTORY (left) =================
+        # 1. DIRECTORY (left)
         dir_frame = QFrame()
         dir_frame.setObjectName("PanelFrame")
         dir_layout = QVBoxLayout(dir_frame)
@@ -617,14 +628,17 @@ class ChatPage(QWidget):
         self.chat_list.setUniformItemSizes(True)
         dir_layout.addWidget(self.chat_list, 1)
 
+        self.browse_groups_btn = QPushButton("Browse Groups")
+        self.browse_groups_btn.setObjectName("BrowseGroupsButton")
         self.new_group_btn = QPushButton("+   New Group")
         self.new_group_btn.setObjectName("NewGroupButton")
-        self.new_group_btn.setCursor(Qt.PointingHandCursor)
-        dir_layout.addWidget(self.new_group_btn)
+        for b in (self.browse_groups_btn, self.new_group_btn):
+            b.setCursor(Qt.PointingHandCursor)
+            dir_layout.addWidget(b)
 
         left = self._column(self._make_tab("DIRECTORY"), dir_frame)
 
-        # ================= 2. CHAT (center) =================
+        # 2. CHAT (center)
         chat_frame = QFrame()
         chat_frame.setObjectName("PanelFrame")
         chat_layout = QVBoxLayout(chat_frame)
@@ -678,7 +692,7 @@ class ChatPage(QWidget):
         self.send_btn = self._icon_button("send", BLACK, "Send message", 30)
         input_row.addWidget(self.send_btn, 0, Qt.AlignBottom)
         entry_layout.addLayout(input_row)
-        self.hint_label = hint = QLabel(HINT_TEXT)
+        self.hint_label = hint = QLabel("Enter to send · Shift + Enter for a new line")
         hint.setObjectName("HintLabel")
         entry_layout.addWidget(hint)
         conv_layout.addWidget(entry)
@@ -693,6 +707,7 @@ class ChatPage(QWidget):
         invite_col.addStretch(1)
         self.invite_text = QLabel("")
         self.invite_text.setObjectName("InviteText")
+        self.invite_text.setTextFormat(Qt.PlainText)        # holds a group name somebody else chose
         self.invite_text.setAlignment(Qt.AlignCenter)
         self.invite_text.setWordWrap(True)
         self.invite_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)    # never widens the column
@@ -719,7 +734,7 @@ class ChatPage(QWidget):
 
         center = self._column(self._make_tab("CHAT"), chat_frame)
 
-        # ================= 3. MEMBERS + SUMMARY (right) =================
+        # 3. MEMBERS + SUMMARY (right)
         members_frame = QFrame()
         members_frame.setObjectName("PanelFrame")
         members_layout = QVBoxLayout(members_frame)
@@ -785,11 +800,11 @@ class ChatPage(QWidget):
         main_layout.addLayout(center, 48)
         main_layout.addLayout(right, 21)
 
-        # ================= interactions -> dummy functions =================
         self.edit_profile_btn.clicked.connect(self.edit_profile)
         self.logout_btn.clicked.connect(self.logout)
         self.change_password_btn.clicked.connect(self.change_password)
         self.new_group_btn.clicked.connect(self.new_group)
+        self.browse_groups_btn.clicked.connect(self.browse_groups)
         self.generate_summary_btn.clicked.connect(self.generate_summary)
         self.switch_member_btn.clicked.connect(self.switch_member)
         self.add_people_btn.clicked.connect(self.add_people_to_group)
@@ -799,9 +814,8 @@ class ChatPage(QWidget):
         self.msg_input.sendRequested.connect(self.send_message)
         self.chat_list.currentItemChanged.connect(self._on_chat_item_changed)
 
-    # ------------------------------------------------------------------ buttons
-    # The buttons open pop-ups (dialogs.py). A pop-up's SAVE button calls one of the dummy
-    # request_* functions below; the backend's answer is reported with finish_dialog().
+    # The buttons open pop-ups (dialogs.py). A pop-up's SAVE button calls one of the request_*
+    # methods below; the backend's answer is reported with finish_dialog().
     def edit_profile(self):
         """Edit profile button -> pop-up with the user's name and colours."""
         fg, bg = self.user_style(self._me)
@@ -814,6 +828,14 @@ class ChatPage(QWidget):
     def new_group(self):
         """+ New Group button -> pop-up asking for the group name."""
         self._open_dialog("group", NewGroupDialog(self), self.request_new_group)
+
+    def browse_groups(self):
+        """Browse Groups button -> pop-up listing every group on the server with its members.
+        JOIN calls request_join_group(chat_id)."""
+        dialog = BrowseGroupsDialog(self)
+        self._open_dialog("browse", dialog, self.request_join_group)
+        if self._dialog is dialog:
+            self.request_all_groups()
 
     def logout(self):
         """Log out button. main.py listens to logout_requested: it disconnects the socket,
@@ -833,18 +855,39 @@ class ChatPage(QWidget):
         self._sync_members_view()
 
     def generate_summary(self):
-        """Generate button next to SUMMARY. -> ask the backend for a summary of the selected chat.
-        When the reply arrives call set_summary(text)."""
+        """Generate button next to SUMMARY. -> GET chat/{chat_id}/summary {mode, count}
+        (an AI summary of the latest messages; it can take a few seconds) -> set_summary(text).
+        It goes over the second connection (api.SideChannel), so the other calls don't wait for it."""
         chat_id = self._chat_id
-        if chat_id is None or self._pending or self._summary_busy:
+        if chat_id is None or self._pending or self.api is None or self._summary_busy():
             return
-        self._summary_busy = True
-        self.generate_summary_btn.setEnabled(False)
+        self._summary_seq += 1
+        seq, self._summary_chat = self._summary_seq, chat_id
+        self._summary_running = seq
         self.set_summary("Generating summary...")
-        # GET chat/{chat_id}/summary: the newest 50 messages (the server may take a while)
-        if self._send(GET_MTDC, f"chat/{chat_id}/summary", {"mode": "recent", "count": 50}, chat_id=chat_id) is None:
-            self._summary_busy = False
-            self.generate_summary_btn.setEnabled(True)
+        self._sync_summary_button()
+
+        def current():
+            return seq == self._summary_seq and chat_id == self._chat_id
+
+        def finished(text):
+            if self._summary_running == seq:
+                self._summary_running = None
+            if current():
+                self.set_summary(text)
+                self._sync_summary_button()
+
+        self._call(GET, f"chat/{chat_id}/summary", {"mode": "recent", "count": SUMMARY_COUNT},
+                   lambda data: finished(data.get("summary") or "Nothing to summarize yet."),
+                   lambda err: finished(f"Couldn't generate a summary: {err.message}"),
+                   via=self.side)
+
+    def _summary_busy(self):
+        """A summary for the chat on screen is still being made."""
+        return self._summary_running is not None and self._summary_running == self._summary_seq
+
+    def _sync_summary_button(self):
+        self.generate_summary_btn.setEnabled(not self._pending and not self._summary_busy())
 
     def add_people_to_group(self):
         """Add-people icon in the chat header -> pop-up: search the online users and everyone the
@@ -865,608 +908,545 @@ class ChatPage(QWidget):
             d.set_users(query, users)
 
     def send_message(self):
-        """Send button / Enter in the chat box. -> POST /chat/{chat_id}/message
-        Read the text with message_text(); call clear_input() once the backend accepted it."""
-        chat_id, text = self._chat_id, self.message_text()
-        if chat_id is None or self._pending or not text or self._sending:
+        """Send button / Enter in the chat box. -> POST chat/{chat_id}/message {content}
+        The backend takes "content" or "text" on the way in and spells it "text" in the message
+        that comes back; "content" is sent because every build of the backend accepts it.
+        The box is cleared once the backend accepted the message."""
+        text, chat_id = self.message_text(), self._chat_id
+        if not text or chat_id is None or self._pending or self.api is None:
             return
-        self._sending = True
-        if self._send(POST_MTDC, f"chat/{chat_id}/message", {"content": text}, chat_id=chat_id) is None:
-            self._sending = False
+        if len(text) > MESSAGE_MAX_LEN:
+            self.show_notice(f"Message too long ({len(text)}/{MESSAGE_MAX_LEN} characters)")
+            return
+        if self._sending == (chat_id, text):
+            return                                  # the same text is already on its way (Enter twice)
+        self._sending = (chat_id, text)
+
+        def sent(data):
+            self._sending = None
+            if self.message_text() == text:
+                self.clear_input()
+            msg = _message_row(data.get("message") or data, self._my_id)
+            msg["own"] = True
+            self.append_message(msg, chat_id)       # ignored if another chat is open by now
+            self._touch_chat(chat_id, msg["time"])
+
+        def failed(err):
+            self._sending = None
+            self.show_notice(f"Couldn't send: {err.message}")
+
+        self._call(POST, f"chat/{chat_id}/message", {"content": text}, sent, failed)
 
     def select_chat(self, chat_id):
-        """A chat was clicked in the directory. -> GET /chat/{chat_id}/info and /messages,
-        then feed set_members(..., chat_id), set_messages(..., chat_id=chat_id)."""
+        """A chat was clicked in the directory. -> GET chat/{chat_id}/info and chat/{chat_id}/messages,
+        then set_members(..., chat_id), set_messages(..., chat_id=chat_id). When the first unread
+        message is older than the newest page, older pages (before_id) are loaded until it is in, so
+        the NEW line is drawn and no unread message is marked read without being shown."""
+        if chat_id is None or self.api is None:
+            return
         chat = self._chat_data(chat_id)
-        if not chat_id or self._pending or (chat and chat.get("pending")):
+        if chat is None or chat.get("pending"):
             return
+        if chat_id != self._summary_chat:            # the summary belongs to the chat it was made for
+            self._summary_seq += 1
+            self._summary_chat = None
+            self.summary_text.clear()
+        self._sync_summary_button()
+        self._load_seq += 1
+        token = self._load_seq
         self._loading_chat = chat_id
-        self.request_group_members(chat_id)                          # GET chat/{id}/info
-        self._send(GET_MTDC, f"chat/{chat_id}/messages", {"count": 50}, chat_id=chat_id)
+        self._early[chat_id] = []
+        self.request_group_members(chat_id)
+        st = {"rows": [], "first": None, "older": 0}    # rows loaded so far (oldest first)
 
-    # The Great ROUTER ----------------------------------------------------------------
-    # main.py hands over EVERY reply and push that is not a login/sign-up one:
-    #   status_code  200 / 250 bad request / 251 unauthorized / 252 forbidden / 253 not found / 254 internal
-    #   path         the request URL (replies) or 'event/<name>' (pushes), no leading/trailing '/'
-    #   data_obj     the reply JSON: 'method' ("GET"/"POST"/"PATCH", absent in pushes), 'rid' (the id this
-    #                page put in the request), 'error' / 'detail' / 'field' on failures, then the call's fields.
-    # A reply is routed by (method, path pattern) where every UUID in the path becomes '{}';
-    # the per-call context (which dialog, which chat...) comes back through `rid`.
-    _HANDLERS = {
-        ("GET", "users/info"): "_h_users_info",
-        ("PATCH", "users/profile"): "_h_profile",
-        ("GET", "users/online"): "_h_online",
-        ("GET", "users/requests"): "_h_requests",
-        ("POST", "users/requests/{}/accept"): "_h_request_accept",
-        ("POST", "users/requests/{}/decline"): "_h_request_decline",
-        ("POST", "users/{}/dm"): "_h_dm",
-        ("POST", "users/logout"): "_h_ignore",
-        ("GET", "chats"): "_h_chats",
-        ("POST", "chats"): "_h_new_group",
-        ("GET", "chats/groups"): "_h_groups",
-        ("GET", "chat/{}/info"): "_h_chat_info",
-        ("GET", "chat/{}/messages"): "_h_chat_messages",
-        ("GET", "chat/{}/summary"): "_h_chat_summary",
-        ("POST", "chat/{}/message"): "_h_chat_message",
-        ("POST", "chat/{}/read"): "_h_ignore",
-        ("POST", "chat/{}/invite"): "_h_invite",
-    }
-    _EVENTS = {
-        "message": "_e_message", "presence": "_e_presence", "request": "_e_request", "chat": "_e_chat",
-        "group_created": "_e_group_created", "group_updated": "_e_group_updated",
-        "group_deleted": "_e_group_deleted", "profile": "_e_profile", "session_revoked": "_e_session_revoked",
-    }
-    _REVOKED = {
-        "logged_in_elsewhere": "Your account was opened somewhere else.",
-        "logged_out": "You were logged out.",
-        "password_changed": "Your password was changed on another device.",
-        "expired": "Your session expired.",
-        "too_many_connections": "Too many connections for this account.",
-    }
+        def current():
+            return token == self._load_seq and chat_id == self._chat_id and not self._pending
 
-    def router(self, status_code, path, data_obj):
-        if not RequestCord.has_auth() or not isinstance(data_obj, dict):
-            return                                  # logged out: a late packet means nothing
-        parts = [p for p in str(path).strip("/").split("/") if p]
-        if not parts:
-            return
-        if parts[0].lower() == "event":             # a push nobody asked for
-            name = self._EVENTS.get(parts[1].lower() if len(parts) > 1 else "")
-            if name and status_code == 200:
-                getattr(self, name)(data_obj)
-            return
-        method = str(data_obj.get("method", "")).upper()
-        ctx = self._calls.pop(data_obj.get("rid"), {})
-        if status_code == 251:                      # this connection is not logged in any more
-            self.session_ended.emit("Your session has ended. Please log in again.")
-            return
-        pattern, ids = self._pattern(parts)
-        name = self._HANDLERS.get((method, pattern))
-        if name is not None:
-            getattr(self, name)(status_code, data_obj, ids, ctx)
+        def show(first):
+            if self._loading_chat == chat_id:
+                self._loading_chat = None
+            rows = st["rows"]
+            if st["first"] is None and rows:
+                self._read_upto[chat_id] = rows[-1]["id"]      # the server has all of these as read
+            seen = {m["id"] for m in rows}
+            # pushes that came while loading (counted as unread meanwhile; cleared at the bottom)
+            rows = rows + [m for m in self._early.pop(chat_id, []) if m["id"] not in seen]
+            self.set_messages(rows, first_unread_id=first, chat_id=chat_id)
 
-    @staticmethod
-    def _pattern(parts):
-        pattern, ids = [parts[0].lower()], []
-        for p in parts[1:]:
-            try:
-                uuid.UUID(p)
-            except ValueError:
-                pattern.append(p.lower())
-            else:
-                pattern.append("{}")
-                ids.append(p)
-        return "/".join(pattern), ids
+        def loaded(data):
+            if not current():
+                return                              # the user moved on: a late reply
+            st["rows"] = [_message_row(m, self._my_id) for m in data.get("messages", [])] + st["rows"]
+            if st["older"] == 0:
+                st["first"] = data.get("first_unread_id")
+            rows, first = st["rows"], st["first"]
+            if first is not None and rows and _id_before(first, rows[0]["id"]):
+                if data.get("has_more") and st["older"] < OLDER_PAGES_MAX:
+                    st["older"] += 1
+                    self._call(GET, f"chat/{chat_id}/messages", {"count": OLDER_PAGE, "before_id": rows[0]["id"]},
+                               loaded, failed)
+                    return
+                first = rows[0]["id"]               # still further back: NEW above the oldest one shown
+            show(first)
 
-    def request_rejected(self, request, message):
-        """main.py could not send `request`: answer it with a local error so nothing waits forever."""
-        try:
-            rid = json.loads(request.msg or "{}").get("rid")
-        except (ValueError, AttributeError):
-            rid = None
-        method = {POST_MTDC: "POST", GET_MTDC: "GET", PATCH_MTDC: "PATCH"}.get(request.method, "")
-        self.router(250, request.url, {"path": request.url, "method": method, "rid": rid,
-                                       "error": "CLIENT_ERROR", "detail": message})
+        def failed(err):
+            if not current():
+                return
+            if st["rows"]:                          # an older page failed: show what is here
+                show(st["rows"][0]["id"])
+            elif self._loading_chat == chat_id:
+                self._loading_chat = None
+            self.show_notice(f"Couldn't load the messages: {err.message}")
 
-    # ------------------------------------------------------------------ sending
-    def _send(self, method, url, data=None, **ctx):
-        """Build a request (the session is copied in by RequestCord) and emit it. `ctx` comes back
-        to the reply handler through the rid. Returns the rid, or None if it could not be built."""
-        self._rid += 1
-        rid = self._rid
-        body = dict(data or {})
-        body["rid"] = rid
-        try:
-            req = RequestCord.from_dict(method, url, body)
-        except ValueError:
-            return None
-        self._calls[rid] = ctx
-        self.request.emit(req)
-        return rid
+        self._call(GET, f"chat/{chat_id}/messages", {"count": MESSAGE_PAGE}, loaded, failed)
 
-    @staticmethod
-    def _err(data):
-        return str(data.get("detail") or data.get("error") or "Something went wrong")
-
-    def _finish(self, kind, ok, message="", field=None):
-        """finish_dialog(), but only if the pop-up that asked is still the one that is open."""
-        if self._dialog is not None and self._dialog_kind == kind:
-            self.finish_dialog(ok, message, field)
-
-    def _flash_hint(self, text):
-        """Short red notice in the line under the chat box (a failed send)."""
-        self.hint_label.setText(text)
-        self.hint_label.setStyleSheet(f"color: {RED};")
-        QTimer.singleShot(5000, self._restore_hint)
-
-    def _restore_hint(self):
-        self.hint_label.setText(HINT_TEXT)
-        self.hint_label.setStyleSheet("")
-
-    # ------------------------------------------------------------------ the request functions
-    def load_initial(self):
-        """Right after logging in: my account, my chats, my invitations, who is online."""
-        self._presence_seq = 0
-        self._send(GET_MTDC, "users/info")
-        self._send(GET_MTDC, "chats")
-        self._send(GET_MTDC, "users/requests")
-        self._send(GET_MTDC, "users/online")
-
+    # Each one sends a RequestCord through api.py (README: RequestCord Calls). For the pop-up
+    # ones the answer goes to finish_dialog(ok, message, field).
     def request_edit_profile(self, username, text_color, background):
-        """PATCH users/profile  {text_color, text_bg_color}  (the name itself cannot be changed)"""
+        """PATCH users/profile  {username, text_color, background}: only the fields that changed."""
+        dialog = self._dialog
+        fg, bg = self.user_style(self._me)
+        body = {}
         if username != self._me:
-            self.finish_dialog(False, "The username can't be changed", "username")
+            body["username"] = username
+        if text_color != fg.upper():            # styles.py writes its own defaults in lower case
+            body["text_color"] = text_color
+        if background != bg.upper():
+            body["background"] = background
+        if not body:
+            self._finish_for(dialog, True)
             return
-        self._send(PATCH_MTDC, "users/profile", {"text_color": text_color, "text_bg_color": background},
-                   dialog="profile")
+
+        def saved(data):
+            u = data.get("user") or data
+            values = {"username": u.get("username") or username,
+                      "text_color": u.get("text_color") or text_color,
+                      "background": u.get("background") or background}
+            if self._dialog is dialog:
+                self._dialog_values = values
+                self.finish_dialog(True)
+            else:                                   # the pop-up was closed meanwhile: still apply it
+                self._apply_dialog_result("profile", values)
+
+        def failed(err):
+            field = {"username": "username", "text_color": "text_color",
+                     "background": "background"}.get(err.field)
+            self._finish_for(dialog, False, err.message, field)
+
+        self._call(PATCH, "users/profile", body, saved, failed)
 
     def request_change_password(self, new_password):
-        """PATCH users/profile/password  (SCRAM flow, not implemented here)"""
-        pass
+        """PATCH users/password  {new_password}. The pop-up asks for no current password, and the
+        session token does not change, so this connection and the summary's keep working."""
+        dialog = self._dialog
+        self._call(PATCH, "users/password", {"new_password": new_password},
+                   lambda data: self._finish_for(dialog, True),
+                   lambda err: self._finish_for(dialog, False, err.message,
+                                                "new_password" if err.field == "new_password" else None))
 
     def request_new_group(self, name):
-        """POST chats  {name}"""
-        self._send(POST_MTDC, "chats", {"name": name}, dialog="group")
+        """POST chats {name} -> the directory is refreshed and the new group opens."""
+        dialog = self._dialog
+
+        def created(data):
+            self._finish_for(dialog, True)
+            chat_id = (data.get("chat") or data).get("chat_id")
+            self.refresh_chats(then=lambda: self.open_chat(chat_id))
+
+        self._call(POST, "chats", {"name": name}, created,
+                   lambda err: self._finish_for(dialog, False, err.message,
+                                                "name" if err.field == "name" else None))
+
+    def request_all_groups(self):
+        """GET chats/groups {count, offset}, page after page while has_more -> set_all_groups(groups).
+        Only the newest read is shown, so an older answer cannot hide what a push just changed."""
+        self._groups_seq += 1
+        seq, groups = self._groups_seq, []
+
+        def got(data):
+            if seq != self._groups_seq:
+                return
+            page = data.get("groups") or []
+            groups.extend(page)
+            if data.get("has_more") and page:
+                self._call(GET, "chats/groups", {"count": GROUP_PAGE, "offset": len(groups)}, got, failed)
+            else:
+                self.set_all_groups(groups)
+
+        def failed(err):
+            d = self._dialog
+            if seq == self._groups_seq and d is not None and self._dialog_kind == "browse":
+                d.groups_field.show_message(err.message)
+
+        self._call(GET, "chats/groups", {"count": GROUP_PAGE}, got, failed)
+
+    def request_join_group(self, chat_id):
+        """JOIN in the Browse groups pop-up: POST chat/{chat_id}/join. The user joins by themselves (a
+        pending invitation to the group counts as accepted); the pop-up closes and the group opens."""
+        dialog = self._dialog
+
+        def joined(data):
+            self._finish_for(dialog, True)
+            self.refresh_chats(then=lambda: self.open_chat(chat_id))
+
+        self._call(POST, f"chat/{chat_id}/join", None, joined,
+                   lambda err: self._finish_for(dialog, False, err.message))
 
     def request_invite(self, username, chat_id, user_id=None):
-        """POST chat/{chat_id}/invite  {user_id}"""
-        kind = self._dialog_kind
-        user_id = user_id or self._uids.get(str(username).lower())
-        if not user_id:
-            self._finish(kind, False, f"Unknown user {username}", "user" if kind == "add_people" else "username")
-            return
-        self._send(POST_MTDC, f"chat/{chat_id}/invite", {"user_id": user_id}, dialog=kind)
+        """POST chat/{chat_id}/invite  {user_id}
+        user_id is known when the user was picked in the Invite people pop-up; from the right-click
+        pop-up only the name is known, so it comes from the member row."""
+        dialog = self._dialog
+
+        def failed(err):
+            self._finish_for(dialog, False, err.message)
+
+        def invite(uid):
+            self._call(POST, f"chat/{chat_id}/invite", {"user_id": uid},
+                       lambda data: self._finish_for(dialog, True), failed)
+
+        if user_id is not None:
+            invite(user_id)
+        else:
+            self._with_user_id(username, invite, failed)
 
     def request_invitees(self, chat_id, query):
-        """Online users + everyone I have a DM with, filtered by `query` -> set_invitees(...).
-        (GET users/online, the DM partners come from the directory.)"""
-        self._send(GET_MTDC, "users/online", None, purpose="invitees", chat_id=chat_id, query=query)
+        """GET chat/{chat_id}/invitees  {query} -> set_invitees(chat_id, query, users)"""
+        def found(data):
+            users = [{"user_id": u.get("user_id"), "username": u.get("username", "")}
+                     for u in data.get("users", [])]
+            self.set_invitees(chat_id, query, users)
+
+        def failed(err):
+            d = self._dialog
+            if (d is not None and self._dialog_kind == "add_people" and d.chat_id == chat_id
+                    and getattr(d, "_query", query) == query):
+                d.results.show_message(err.message)
+
+        self._call(GET, f"chat/{chat_id}/invitees", {"query": query}, found, failed)
 
     def request_message(self, username, greeting):
-        """POST users/{user_id}/dm  {message}"""
-        user_id = self._uids.get(str(username).lower())
-        if not user_id:
-            self.finish_dialog(False, f"Unknown user {username}", "username")
-            return
-        self._send(POST_MTDC, f"users/{user_id}/dm", {"message": greeting}, dialog="message")
+        """POST users/{user_id}/dm  {message: greeting}. The backend opens the DM at once (or reuses
+        the existing one) and the client switches to it."""
+        dialog = self._dialog
+
+        def failed(err):
+            self._finish_for(dialog, False, err.message)
+
+        def sent(data):
+            self._finish_for(dialog, True)
+            chat_id = data.get("chat_id") or (data.get("chat") or {}).get("chat_id")
+            if not chat_id:
+                self.show_notice(f"The DM with {username} did not open")
+                return
+            self.refresh_chats(then=lambda: self.open_chat(chat_id))
+
+        self._with_user_id(username, lambda uid: self._call(POST, f"users/{uid}/dm", {"message": greeting},
+                                                            sent, failed), failed)
 
     def request_user_groups(self, username):
-        """GET chats/groups (every group, with members) -> the ones `username` is a member of."""
-        self._send(GET_MTDC, "chats/groups", {"count": 200, "offset": 0},
-                   username=username, user_id=self._uids.get(str(username).lower()), found=[], offset=0)
+        """GET users/{user_id}/groups -> set_user_groups(username, groups)
+        (or finish_dialog(False, message) when it failed)."""
+        dialog = self._dialog
+
+        def failed(err):
+            self._finish_for(dialog, False, err.message)
+
+        def got(data):
+            self.set_user_groups(username, data.get("groups", []))
+
+        self._with_user_id(username, lambda uid: self._call(GET, f"users/{uid}/groups", None, got, failed),
+                           failed)
 
     def request_accept_invite(self, chat_id):
-        """POST users/requests/{request_id}/accept"""
-        self._answer("accept", chat_id)
+        """Accept button on an invitation: POST chat/{chat_id}/invite/accept
+        -> resolve_invite / invite_failed."""
+        def joined(data):
+            self.resolve_invite(chat_id, True)      # loads the chat if it is open
+            self.refresh_chats()                    # real unread count and last activity
+
+        self._call(POST, f"chat/{chat_id}/invite/accept", None, joined,
+                   lambda err: self.invite_failed(chat_id, err.message))
 
     def request_reject_invite(self, chat_id):
-        """POST users/requests/{request_id}/decline"""
-        self._answer("decline", chat_id)
-
-    def _answer(self, verb, chat_id):
-        chat = self._chat_data(chat_id) or {}
-        rid = chat.get("request_id")
-        if not rid:
-            self.invite_failed(chat_id, "This invitation is no longer available")
-            return
-        self._send(POST_MTDC, f"users/requests/{rid}/{verb}", None, chat_id=chat_id)
+        """Reject button on an invitation: POST chat/{chat_id}/invite/reject
+        -> resolve_invite / invite_failed."""
+        self._call(POST, f"chat/{chat_id}/invite/reject", None,
+                   lambda data: self.resolve_invite(chat_id, False),
+                   lambda err: self.invite_failed(chat_id, err.message))
 
     def request_group_members(self, chat_id):
-        """GET chat/{chat_id}/info -> set_members"""
-        self._send(GET_MTDC, f"chat/{chat_id}/info", None, chat_id=chat_id)
+        """GET chat/{chat_id}/info -> set_members(members, chat_id)"""
+        def got(data):
+            members = (data.get("chat") or data).get("members", [])
+            self._absorb_users(members)
+            self.set_members([_member_row(m, self._my_id) for m in members], chat_id)
+
+        self._call(GET, f"chat/{chat_id}/info", None, got,
+                   lambda err: chat_id == self._chat_id and self.show_notice(
+                       f"Couldn't load the members: {err.message}"))
 
     def request_online_users(self):
-        """GET users/online -> set_online_users"""
-        self._send(GET_MTDC, "users/online")
+        """GET users/online -> set_online_users(users)"""
+        def got(data):
+            users = data.get("users", [])
+            self._absorb_users(users)
+            self.set_online_users([_member_row(u, self._my_id) for u in users])
 
-    def request_mark_read(self, chat_id):
-        """POST chat/{chat_id}/read  {message_id: newest message shown}"""
-        data = {}
-        if chat_id == self._chat_id and self._messages_chat == chat_id and self._messages:
-            last = self._messages[-1].get("id")
-            if isinstance(last, str):
-                data["message_id"] = last
-        self._send(POST_MTDC, f"chat/{chat_id}/read", data, chat_id=chat_id)
+        self._call(GET, "users/online", None, got)
 
-    # ------------------------------------------------------------------ reply handlers
-    def _h_ignore(self, status, d, ids, ctx):
-        pass
+    def request_mark_read(self, chat_id, message_id):
+        """The user is at the bottom of the chat: POST chat/{chat_id}/read {message_id: newest shown}."""
+        def failed(err):
+            if self._read_upto.get(chat_id) == message_id:
+                self._read_upto.pop(chat_id, None)  # not read on the server: the next look tries again
 
-    def _h_users_info(self, status, d, ids, ctx):
-        user = d.get("user")
-        if status != 200 or not isinstance(user, dict):
+        self._call(POST, f"chat/{chat_id}/read", {"message_id": message_id}, None, failed)
+
+    # called by main.py
+    def attach(self, api, side=None):
+        """Wires the page to the dispatcher (api.py): its calls and the server pushes.
+        side: the SideChannel for the summary (without one it uses the main connection)."""
+        self.api, self.side = api, side
+        for path, handler in (("chat/new_message", self._on_new_message),
+                              ("chats/new", self._on_chats_changed),
+                              ("chat/members_changed", self._on_members_changed),
+                              ("users/profile_changed", self._on_profile_changed),
+                              ("users/status", self._on_status_event),
+                              ("chats/group_created", self._refresh_browse),
+                              ("chats/group_deleted", self._on_group_deleted)):
+            api.on(path, lambda data, h=handler: self.session is not None and h(data))
+
+    def start_session(self, user, session):
+        """Logged in: show the profile, then GET users/info and the chat list."""
+        self.session = session
+        self._my_id = str(user.get("user_id") or session.user_id)
+        self._apply_me(user)
+        self._call(GET, "users/info", None, lambda data: self._apply_me(data.get("user") or data))
+        self.refresh_chats()
+
+    def _apply_me(self, user):
+        name = user.get("username")
+        if not name:
             return
-        self._learn(user)
-        self.set_profile(user["username"])
-
-    def _h_profile(self, status, d, ids, ctx):
-        if status == 200:
-            self._finish("profile", True)
-            self._learn(d.get("user"))              # the server's lower-case colours
-            return
-        field = {"text_color": "text_color", "text_bg_color": "background"}.get(d.get("field"))
-        self._finish("profile", False, self._err(d), field)
-
-    def _h_online(self, status, d, ids, ctx):
-        if status != 200:
-            if ctx.get("purpose") == "invitees":
-                self._finish("add_people", False, self._err(d), "user")
-            return
-        users = d.get("users") or []
-        if isinstance(d.get("presence_seq"), int):
-            self._presence_seq = max(self._presence_seq, d["presence_seq"])
-        for u in users:
-            self._learn(u)
-        if ctx.get("purpose") == "invitees":
-            self._answer_invitees(ctx, users)
-            return
-        self.set_online_users([{"username": u["username"], "user_id": u["user_id"],
-                                "is_me": bool(u.get("is_self"))} for u in users])
-
-    def _answer_invitees(self, ctx, online):
-        chat_id, query = ctx["chat_id"], str(ctx.get("query", ""))
-        found = {u["user_id"]: u["username"] for u in online if not u.get("is_self")}
-        for chat in self._rows():
-            if chat.get("is_dm") and chat.get("peer_id"):
-                found[chat["peer_id"]] = chat["name"]
-        if chat_id == self._chat_id:                # already in the group: nothing to invite
-            for m in self._members:
-                found.pop(m.get("user_id"), None)
-        needle = query.strip().lower()
-        users = [{"user_id": uid, "username": name} for uid, name in found.items() if needle in name.lower()]
-        users.sort(key=lambda u: u["username"].lower())
-        self.set_invitees(chat_id, query, users)
-
-    def _h_requests(self, status, d, ids, ctx):
-        if status != 200:
-            return
-        invites = [r for r in d.get("incoming") or [] if r.get("kind") == "invite"]
-        for r in invites:
-            self._learn(r.get("from"))
-        joined = {c["chat_id"] for c in self._rows() if not c.get("pending")}
-        rows = [c for c in self._rows() if not c.get("pending")]
-        rows += [row for row in map(self._invite_row, invites) if row and row["chat_id"] not in joined]
-        self._publish(rows)
-
-    @staticmethod
-    def _invite_row(request):
-        chat = request.get("chat") or {}
-        if not chat.get("chat_id"):
-            return None
-        return {"chat_id": chat["chat_id"], "name": chat.get("name", ""), "pending": True, "unread": 0,
-                "is_dm": False, "request_id": request.get("request_id")}
-
-    def _h_request_accept(self, status, d, ids, ctx):
-        chat_id = ctx.get("chat_id")
-        if chat_id is None:
-            return
-        if status != 200:
-            self._invite_gone_or_failed(status, d, chat_id)
-            return
-        chat = d.get("chat")
-        if not isinstance(chat, dict):              # the group was deleted at that moment
-            self.resolve_invite(chat_id, False)
-            return
-        self.resolve_invite(chat_id, True)
-        self._upsert(self._chat_row(chat))
-
-    def _h_request_decline(self, status, d, ids, ctx):
-        chat_id = ctx.get("chat_id")
-        if chat_id is None:
-            return
-        if status != 200:
-            self._invite_gone_or_failed(status, d, chat_id)
-            return
-        self.resolve_invite(chat_id, False)
-
-    def _invite_gone_or_failed(self, status, d, chat_id):
-        if status == 253:                           # cancelled / group deleted: it is gone
-            self.resolve_invite(chat_id, False)
+        self._me = str(name)
+        fg, bg = user.get("text_color"), user.get("background")
+        if fg and bg:
+            self.set_user_style(self._me, fg, bg)       # also redraws the profile badge
         else:
-            self.invite_failed(chat_id, self._err(d))
+            self.set_profile(self._me)
 
-    def _h_dm(self, status, d, ids, ctx):
-        if status != 200:
-            field = {"message": "greeting"}.get(d.get("field"), "username" if status == 253 else None)
-            self._finish("message", False, self._err(d), field)
-            return
-        self._finish("message", True)
-        chat = d.get("chat")
-        if not isinstance(chat, dict):              # "pending": the server wants the other side to accept
-            return
-        row = self._chat_row(chat)
-        if row["chat_id"] == self._chat_id and self._messages_chat == row["chat_id"]:
-            for m in d.get("messages") or []:       # the DM is open already: show what was just sent
-                msg = self._message_row(m)
-                if not any(x.get("id") == msg["id"] for x in self._messages):
-                    self._stick_to_bottom = True
-                    self.append_message(msg, row["chat_id"])
-            self._upsert(row)
-        else:
-            self._upsert(row, select=row["chat_id"])
+    def show_notice(self, text):
+        """A short error message where the 'Enter to send' hint is, for a few seconds."""
+        self.hint_label.setText(str(text))
+        self.hint_label.setToolTip(str(text))
+        self._notice_timer.start(NOTICE_MS)
 
-    def _h_chats(self, status, d, ids, ctx):
-        if status != 200:
+    def refresh_chats(self, then=None):
+        """GET chats -> set_chats. The list holds the joined chats and the invitations that are
+        still open (`pending`, drawn as [Pending]).
+        `then` runs after the new list is shown (e.g. open_chat of a chat that was just made)."""
+        if then is not None:
+            self._after_refresh.append(then)
+        if self.api is None or self.session is None:
             return
-        chats = [self._chat_row(c) for c in d.get("chats") or []]
-        have = {c["chat_id"] for c in chats}
-        invites = [c for c in self._rows() if c.get("pending") and c["chat_id"] not in have]
-        self._publish(chats + invites)
+        if self._refreshing:
+            self._refresh_again = True
+            return
+        self._refreshing, self._refresh_again = True, False
 
-    def _h_new_group(self, status, d, ids, ctx):
-        if status != 200 or not isinstance(d.get("chat"), dict):
-            self._finish("group", False, self._err(d), "name" if d.get("field") == "name" else None)
-            return
-        self._finish("group", True)
-        row = self._chat_row(d["chat"])
-        self._upsert(row, select=row["chat_id"])
-
-    def _h_groups(self, status, d, ids, ctx):
-        if status != 200:
-            self._finish("groups", False, self._err(d))
-            return
-        username, uid = ctx["username"], ctx.get("user_id")
-        groups = d.get("groups") or []
-        for g in groups:
-            for m in g.get("members") or []:
-                mine = m.get("user_id") == uid if uid else str(m.get("username", "")).lower() == username.lower()
-                if mine:
-                    ctx["found"].append({"chat_id": g["chat_id"], "name": g.get("name", "")})
-                    break
-        offset = ctx["offset"] + len(groups)
-        if d.get("has_more") and groups and offset < 20000:
-            self._send(GET_MTDC, "chats/groups", {"count": 200, "offset": offset},
-                       username=username, user_id=uid, found=ctx["found"], offset=offset)
-            return
-        self.set_user_groups(username, ctx["found"])
-
-    def _h_chat_info(self, status, d, ids, ctx):
-        chat_id = ids[0] if ids else ctx.get("chat_id")
-        if status != 200:
-            if status == 253 and chat_id:
-                self._remove(chat_id)
-            return
-        info = d.get("chat") or {}
-        members = info.get("members") or []
-        for m in members:
-            self._learn(m)
-        self.set_members([{"username": m["username"], "user_id": m["user_id"], "role": m.get("role"),
-                           "online": bool(m.get("online")), "is_me": self._is_me(m.get("user_id"))}
-                          for m in members], chat_id)
-
-    def _h_chat_messages(self, status, d, ids, ctx):
-        chat_id = ids[0] if ids else ctx.get("chat_id")
-        if self._loading_chat == chat_id:
-            self._loading_chat = None
-        if status != 200:
-            if status == 253 and chat_id:
-                self._remove(chat_id)
-            return
-        rows = [self._message_row(m) for m in d.get("messages") or []]
-        self.set_messages(rows, d.get("first_unread_message_id"), chat_id)
-
-    def _h_chat_message(self, status, d, ids, ctx):
-        self._sending = False
-        chat_id = ids[0] if ids else ctx.get("chat_id")
-        if status != 200 or not isinstance(d.get("message"), dict):
-            self._flash_hint(self._err(d))
-            return
-        row = self._message_row(d["message"])
-        if chat_id == self._chat_id:
-            self.clear_input()
-            self._stick_to_bottom = True
-            if not any(x.get("id") == row["id"] for x in self._messages):
-                self.append_message(row, chat_id)
-            self.set_chat_unread(chat_id, 0)        # sending moves my read marker to the end
-        self._bump(chat_id, row.get("time"))
-
-    def _h_chat_summary(self, status, d, ids, ctx):
-        self._summary_busy = False
-        self.generate_summary_btn.setEnabled(not self._pending)
-        if (ids[0] if ids else ctx.get("chat_id")) != self._chat_id:
-            return                                  # another chat is open now
-        if status != 200:
-            self.set_summary(self._err(d))
-            return
-        text = d.get("summary")
-        if text is None:
-            self.set_summary("Nothing to summarize.")
-        elif d.get("engine") == "offline":
-            self.set_summary("(Not written by AI)\n" + str(text))
-        else:
-            self.set_summary(text)
-
-    def _h_invite(self, status, d, ids, ctx):
-        kind = ctx.get("dialog")
-        if status == 200:
-            self._finish(kind, True)
-            return
-        self._finish(kind, False, self._err(d), "user" if kind == "add_people" else "username")
-
-    # ------------------------------------------------------------------ pushes
-    def _e_message(self, d):
-        chat_id, m = d.get("chat_id"), d.get("message")
-        if not chat_id or not isinstance(m, dict):
-            return
-        row = self._message_row(m)
-        chat = self._chat_data(chat_id)
-        if chat is None:
-            self._send(GET_MTDC, "chats")           # a chat this page does not know yet
-            return
-        inc = 0
-        if chat_id == self._chat_id and not chat.get("pending"):
-            if self._messages_chat == chat_id:
-                if not any(x.get("id") == row["id"] for x in self._messages):
-                    self.append_message(row, chat_id)       # counts it as unread if not at the bottom
-        elif not row["own"]:
-            inc = 1
-        self._bump(chat_id, row.get("time"), inc)
-
-    def _e_presence(self, d):
-        seq, user = d.get("seq"), d.get("user")
-        if isinstance(seq, int):
-            if seq <= self._presence_seq:
+        def got(data):
+            self._refreshing = False
+            if self._refresh_again:             # something changed while this was on its way
+                self.refresh_chats()
                 return
-            self._presence_seq = seq
-        if not isinstance(user, dict) or not user.get("user_id"):
+            callbacks, self._after_refresh = self._after_refresh, []
+            self._apply_chat_list(data)
+            for callback in callbacks:
+                callback()
+
+        def failed(err):
+            if self._refreshing:
+                self._refreshing = False
+                self.show_notice(f"Couldn't load the chats: {err.message}")
+
+        self._call(GET, "chats", None, got, failed)
+
+    def _call(self, method, url, data=None, ok=None, error=None, via=None):
+        """api.request, but replies that arrive after a logout (or for an older login) are dropped.
+        Errors without a handler are shown with show_notice. via: another connection (SideChannel)."""
+        if self.api is None:
+            return None
+        gen = self._gen
+
+        def guard(callback):
+            def run(arg):
+                if gen == self._gen and callback is not None:
+                    callback(arg)
+            return run
+
+        if error is None:
+            error = lambda err: self.show_notice(err.message)   # noqa: E731
+        return (via or self.api).request(method, url, data, guard(ok), guard(error))
+
+    def _finish_for(self, dialog, ok, message="", field=None):
+        """finish_dialog, but only if that pop-up is still the one that is open."""
+        if dialog is not None and self._dialog is dialog:
+            self.finish_dialog(ok, message, field)
+
+    def _with_user_id(self, username, then, failed):
+        """then(user_id) for a name from the member / online list (GET users/search if unknown)."""
+        for rows in (self._members, self._online):
+            for row in rows:
+                if row.get("username") == username and row.get("user_id"):
+                    then(row["user_id"])
+                    return
+
+        def found(data):
+            for u in data.get("users", []):
+                if str(u.get("username", "")).lower() == str(username).lower():
+                    then(u["user_id"])
+                    return
+            failed(ApiError(0, "USER_NOT_FOUND", f"Can't find the user {username}"))
+
+        self._call(GET, "users/search", {"query": str(username)[:32], "count": 5}, found, failed)
+
+    def _absorb_users(self, users):
+        """Takes what the member / online rows say about people: the colours every message and badge
+        is drawn in, and their current name. A fresh list is also where a rename shows up, since
+        chat/members_changed says only which chat changed."""
+        changed = False
+        for u in users:
+            name, uid = str(u.get("username") or ""), u.get("user_id")
+            fg, bg = u.get("text_color"), u.get("background")
+            if name and fg and bg and self._user_styles.get(name.lower()) != (fg, bg):
+                self._user_styles[name.lower()] = (fg, bg)
+                changed = True
+            if not name or not uid:
+                continue
+            for msg in self._messages:
+                if msg.get("sender_id") == uid and msg.get("sender") != name:
+                    msg["sender"] = name
+                    changed = True
+        if changed and self._messages:
+            self._render_messages(keep_scroll=True)
+
+    def _touch_chat(self, chat_id, when):
+        chat = self._chat_data(chat_id)
+        if chat is not None and when is not None:
+            self.set_chat_unread(chat_id, int(chat.get("unread", 0) or 0), when)
+
+    def _apply_chat_list(self, chats_reply):
+        rows = [_chat_row(c) for c in chats_reply.get("chats", [])]
+        rows.sort(key=lambda c: c.get("last_activity") or datetime.min, reverse=True)
+        self.set_chats(rows, selected_id=self._chat_id)
+        if self.chat_list.count() == 0:
+            if self._chat_id is not None or self._pending:
+                self._show_chat({})                 # the open chat is gone
             return
-        self._learn(user)
-        online, uid = bool(d.get("online")), user["user_id"]
+        chat_id = self._chat_id
+        if (chat_id is not None and not self._pending and self._messages_chat != chat_id
+                and self._loading_chat != chat_id):
+            self.select_chat(chat_id)               # set_chats picked a chat that is not loaded yet
+        else:
+            self._maybe_mark_read()                 # the open chat now shows the server's count, which
+                                                    # can predate a read sent a moment ago
+
+    def _on_new_message(self, data):
+        """chat/new_message: append it if that chat is open, otherwise count it as unread."""
+        chat_id = data.get("chat_id")
+        msg = _message_row(data.get("message"), self._my_id)
+        chat = self._chat_data(chat_id)
+        if chat is None or chat.get("pending"):
+            self.refresh_chats()                    # a chat this list does not have yet
+            return
+        if chat_id == self._chat_id:
+            if self._loading_chat == chat_id:
+                self._early.setdefault(chat_id, []).append(msg)    # shown once the chat has loaded
+                unread = int(chat.get("unread", 0) or 0) + (0 if msg["own"] else 1)
+                self.set_chat_unread(chat_id, unread, msg["time"])
+                return
+            if self._messages_chat == chat_id:
+                if not any(m.get("id") == msg["id"] for m in self._messages):
+                    self.append_message(msg, chat_id)
+                self._touch_chat(chat_id, msg["time"])
+                return
+        unread = int(chat.get("unread", 0) or 0) + (0 if msg["own"] else 1)
+        self.set_chat_unread(chat_id, unread, msg["time"])
+
+    def _on_status_event(self, data):
+        """users/status {user_id, online}: the ONLINE list and the dots in the member list. The push
+        carries no name or colours, so someone appearing for the first time needs the whole list."""
+        uid, online = data.get("user_id"), bool(data.get("online"))
+        if uid is None:
+            return
         for m in self._members:
             if m.get("user_id") == uid:
                 m["online"] = online
-        self._online = [u for u in self._online if u.get("user_id") != uid]
-        if online:
-            self._online.append({"username": user["username"], "user_id": uid, "online": True,
-                                 "is_me": self._is_me(uid)})
-            self._online.sort(key=lambda u: u["username"].lower())
+        known = next((u for u in self._online if u.get("user_id") == uid), None)
+        if online and known is None:
+            if self._members_mode == ONLINE:
+                self.request_online_users()
+            else:
+                self._refresh_members()             # the dots are already right
+            return
+        if not online:
+            self._online = [u for u in self._online if u.get("user_id") != uid]
         self._refresh_members()
 
-    def _e_request(self, d):
-        r = d.get("request") or {}
-        if r.get("kind") != "invite":
+    def _on_chats_changed(self, data):
+        """chats/new {chat}: invited to a group, or a DM was opened with this user. The row is
+        not kept from the push: GET chats lists the invitations too (`pending`), so the list it
+        answers with is the whole truth and a row cannot be left behind once the invitation is
+        answered or the inviter takes it back. An open Browse groups pop-up then marks the invitation."""
+        self.refresh_chats(then=self._refresh_browse)
+
+    def _on_profile_changed(self, data):
+        """users/profile_changed {user}: somebody's new username and colours. chat/members_changed
+        covers the chats shared with them; this also reaches the ONLINE list and an open Browse groups
+        pop-up, where somebody the user shares no chat with would otherwise keep their old name."""
+        user = data.get("user") or {}
+        uid, name = user.get("user_id"), str(user.get("username") or "")
+        if not uid or not name:
             return
-        self._learn(r.get("from"))
-        to_me = self._is_me((r.get("to") or {}).get("user_id"))
-        if r.get("status") == "pending" and to_me:
-            row = self._invite_row(r)
-            if row and (self._chat_data(row["chat_id"]) is None):
-                self._upsert(row)
-        elif r.get("status") != "pending":
-            rows = self._rows()
-            keep = [c for c in rows if not (c.get("pending") and c.get("request_id") == r.get("request_id"))]
-            if len(keep) != len(rows):
-                self._publish(keep)
+        for rows in (self._members, self._online):
+            for row in rows:
+                if row.get("user_id") == uid:
+                    row.update({"username": name, "text_color": user.get("text_color"),
+                                "background": user.get("background")})
+        self._absorb_users([user])
+        self._refresh_members()
+        self._refresh_browse()
 
-    def _e_chat(self, d):
-        if isinstance(d.get("chat"), dict):
-            self._upsert(self._chat_row(d["chat"]))
-
-    def _e_group_created(self, d):
-        group = d.get("group") or {}
-        self._learn(group.get("created_by"))
-        if self._is_me((group.get("created_by") or {}).get("user_id")):
-            self._send(GET_MTDC, "chats")           # I made it on another connection
-
-    def _e_group_updated(self, d):
-        chat_id, user = d.get("chat_id"), d.get("user") or {}
-        self._learn(user)
-        mine = self._is_me(user.get("user_id"))
-        chat = self._chat_data(chat_id)
-        if mine and d.get("change") == "left":
-            self._remove(chat_id)
-        elif mine and (chat is None or chat.get("pending")):
-            self._send(GET_MTDC, "chats")           # joined (here or elsewhere): fetch the row
-            self._send(GET_MTDC, "users/requests")
-        elif chat_id == self._chat_id and not (chat or {}).get("pending"):
-            self.request_group_members(chat_id)     # somebody came or went: refresh the member list
-
-    def _e_group_deleted(self, d):
-        if d.get("chat_id"):
-            self._remove(d["chat_id"])
-
-    def _e_profile(self, d):
-        self._learn(d.get("user"))
-
-    def _e_session_revoked(self, d):
-        self.session_ended.emit(self._REVOKED.get(d.get("reason"), "You were logged out."))
-
-    # ------------------------------------------------------------------ adapters / helpers
-    def _is_me(self, user_id):
-        return bool(user_id) and str(user_id).lower() == self.cur_user.lower()
-
-    def _learn(self, user):
-        """Remember a user's id and colours (any User / User ref / Member)."""
-        if not isinstance(user, dict) or not user.get("username"):
+    def _on_members_changed(self, data):
+        """chat/members_changed {chat_id, change}: `joined`, `left`, `profile` (renamed or
+        recoloured) or `invite_cancelled`. The push says no more than which chat changed, so the
+        member list is read again; the directory too, because a DM is named after the other
+        person, a group can have lost its last member, and a cancelled invitation leaves it.
+        Joins and leaves reach everyone, which keeps an open Browse groups pop-up current."""
+        chat_id = data.get("chat_id")
+        if self._members_mode == ONLINE:
+            self.request_online_users()             # a rename or a new colour shows up there too
+        if self._chat_data(chat_id) is None:
+            self.refresh_chats(then=self._refresh_browse)   # a chat this list does not have yet
             return
-        name = user["username"]
-        if user.get("user_id"):
-            self._uids[name.lower()] = user["user_id"]
-        fg, bg = user.get("text_color"), user.get("text_bg_color")
-        if fg and bg and self._user_styles.get(name.lower()) != (fg, bg):
-            self.set_user_style(name, fg, bg)
+        if chat_id == self._chat_id and not self._pending:
+            self.request_group_members(chat_id)
+        self.refresh_chats(then=self._refresh_browse)
 
-    def _message_row(self, m):
-        sender = m.get("sender")
-        self._learn(sender)
-        own = bool(sender) and self._is_me(sender.get("user_id"))
-        row = {"id": m.get("message_id"), "sender": sender["username"] if sender else "(system)",
-               "text": m.get("content", ""), "time": ts(m.get("created_at")), "own": own}
-        if own:
-            row["status"] = "Sent"
-        return row
+    def _on_group_deleted(self, data):
+        """chats/group_deleted {chat_id}: its last member left. An invitation to it leaves the directory."""
+        if self._chat_data(data.get("chat_id")) is not None:
+            self.refresh_chats(then=self._refresh_browse)
+        else:
+            self._refresh_browse()
 
-    def _chat_row(self, c):
-        peer = c.get("peer") or {}
-        self._learn(peer)
-        return {"chat_id": c["chat_id"], "name": c.get("name", ""), "unread": int(c.get("unread") or 0),
-                "last_activity": ts(c.get("last_activity")), "is_dm": bool(c.get("is_dm")),
-                "pending": False, "peer_id": peer.get("user_id"), "description": c.get("description", "")}
+    def _refresh_browse(self, *_):
+        """chats/group_created, and every push that changes a group or its members: the Browse groups
+        pop-up, if it is open, reads every group again."""
+        if self._dialog is not None and self._dialog_kind == "browse":
+            self.request_all_groups()
 
-    def _rows(self):
-        return [dict(self.chat_list.item(i).data(Qt.UserRole) or {}) for i in range(self.chat_list.count())]
-
-    def _publish(self, rows, select=None):
-        """Show `rows` in the directory: invitations first, then the latest activity first. Keeps the
-        selection (or selects `select`) and loads the chat if a different one ended up selected."""
-        previous = self._chat_id
-        floor = datetime.min.replace(tzinfo=timezone.utc)
-        rows = sorted(rows, key=lambda r: r.get("last_activity") or floor, reverse=True)
-        rows.sort(key=lambda r: not r.get("pending"))
-        self.set_chats(rows, selected_id=select if select is not None else previous)
-        if not rows:
-            self._show_chat({})
-            self._chat_id = None
-            self.chat_title.setText("")
-            return
-        chat = self._chat_data(self._chat_id) or {}
-        if chat and not chat.get("pending") and self._chat_id != self._loading_chat \
-                and self._messages_chat != self._chat_id:
-            self.select_chat(self._chat_id)
-
-    def _upsert(self, row, select=None):
-        rows = [r for r in self._rows() if r.get("chat_id") != row["chat_id"]]
-        rows.append(row)
-        self._publish(rows, select)
-
-    def _remove(self, chat_id):
-        rows = self._rows()
-        keep = [r for r in rows if r.get("chat_id") != chat_id]
-        if len(keep) != len(rows):
-            self._publish(keep)
-
-    def _bump(self, chat_id, when=None, unread_inc=0):
-        """A message arrived in `chat_id`: newest activity time, more unread, up to the top."""
-        rows = self._rows()
-        for r in rows:
-            if r.get("chat_id") == chat_id:
-                if when is not None:
-                    r["last_activity"] = when
-                r["unread"] = int(r.get("unread", 0) or 0) + unread_inc
-                self._publish(rows)
-                return
-
-    # ------------------------------------------------------------------ pop-ups
     def _open_dialog(self, kind, dialog, request):
         if self._dialog is not None:
             dialog.deleteLater()
@@ -1517,7 +1497,6 @@ class ChatPage(QWidget):
         self._me = new
         self.set_user_style(new, values["text_color"], values["background"])
 
-    # ------------------------------------------------------------------ member right-click
     def _chat_data(self, chat_id):
         for i in range(self.chat_list.count()):
             chat = self.chat_list.item(i).data(Qt.UserRole) or {}
@@ -1576,11 +1555,24 @@ class ChatPage(QWidget):
         if d is not None and self._dialog_kind == "groups" and self._dialog_values.get("username") == username:
             d.set_groups(groups)
 
+    def set_all_groups(self, groups):
+        """Reply to request_all_groups: every group with its members. A group with a [Pending]
+        invitation in the directory is marked as one."""
+        d = self._dialog
+        if d is None or self._dialog_kind != "browse":
+            return
+        invited = set()
+        for i in range(self.chat_list.count()):
+            chat = self.chat_list.item(i).data(Qt.UserRole) or {}
+            if chat.get("pending"):
+                invited.add(chat.get("chat_id"))
+        d.set_groups(groups, invited)
+
     def message_member(self, username):
         """'Message': pop-up with the initial greeting."""
         self._open_dialog("message", MessageDialog(username, self), self.request_message)
 
-    # ------------------------------------------------------------------ data in (called by main.py)
+    # called by main.py and by the request_* replies
     def message_text(self):
         return self.msg_input.toPlainText().strip()
 
@@ -1690,8 +1682,7 @@ class ChatPage(QWidget):
         own = bool(message.get("own", message.get("sender") == self._me and bool(self._me)))
         if at_bottom:
             self._stick_to_bottom = True
-            if not own and self._chat_id is not None:
-                self.request_mark_read(self._chat_id)   # it is being read right now
+            self._maybe_mark_read(at_bottom=True)       # it is being read right now
         elif not own and self._chat_id is not None:
             chat = self._chat_data(self._chat_id) or {}
             self.set_chat_unread(self._chat_id, int(chat.get("unread", 0) or 0) + 1)
@@ -1709,7 +1700,7 @@ class ChatPage(QWidget):
                 self.chat_list.setCurrentRow(i)
                 return
 
-    # ---- invitations ([Pending] chats)
+    # invitations ([Pending] chats)
     def accept_invite(self):
         self._answer_invite(True)
 
@@ -1759,13 +1750,24 @@ class ChatPage(QWidget):
                 if self.chat_list.count():
                     self._on_chat_item_changed(self.chat_list.currentItem(), None)
                 else:
-                    self._chat_id, self._pending = None, False
-                    self._show_chat({})
+                    self._show_chat({})             # clears the invitation page too
                     self.chat_title.setText("")
             return
 
     def reset(self):
         """Blank page again (after logging out)."""
+        self._gen += 1                              # replies still on their way are dropped
+        self.session, self._my_id = None, None
+        self._loading_chat, self._early = None, {}
+        self._refreshing, self._refresh_again, self._after_refresh = False, False, []
+        self._summary_chat, self._summary_seq = None, self._summary_seq + 1
+        self._summary_running = None
+        self._read_upto = {}
+        self._sending = None
+        self._notice_timer.stop()
+        self.hint_label.setText(self._hint_text)
+        self.hint_label.setToolTip("")
+        self.generate_summary_btn.setEnabled(True)
         self.close_dialog()
         if self._menu is not None:
             self._menu.close()
@@ -1779,10 +1781,6 @@ class ChatPage(QWidget):
         self._members_mode = MEMBERS
         self._pending = False
         self._invite_busy = False
-        self._calls, self._uids, self._presence_seq = {}, {}, 0
-        self._loading_chat, self._sending, self._summary_busy = None, False, False
-        self.generate_summary_btn.setEnabled(True)
-        self._restore_hint()
         self.chat_stack.setCurrentIndex(0)
         self.add_people_btn.show()
         self.chat_list.blockSignals(True)
@@ -1796,7 +1794,6 @@ class ChatPage(QWidget):
         self.summary_text.clear()
         self.msg_input.clear()
 
-    # ------------------------------------------------------------------ internals
     def _sync_input_gap(self):
         """Blank strip above the chat box (messages are cut off at its top edge). It is as tall as
         the distance from the chat box's bottom edge to the frame: hint line + spacing + margin."""
@@ -1850,14 +1847,15 @@ class ChatPage(QWidget):
         if pending:
             self.invite_text.setText(f"You've been invited to join the group {chat.get('name', '')}")
         self.add_people_btn.setVisible(not pending and not chat.get("is_dm"))   # groups only
-        self.generate_summary_btn.setEnabled(not pending)
+        self._sync_summary_button()                  # stays off while this chat's summary is made
         if changed:                                  # nothing of the previous chat may linger
             self.chat_stack.setCurrentIndex(1 if pending else 0)
             self._invite_busy = False
             self.invite_error.setText("")
             for b in (self.accept_btn, self.reject_btn):
                 _repolish(b, "status", "pending")
-            self.summary_text.clear()
+            if pending:
+                self.summary_text.clear()
             self._messages, self._messages_chat, self._first_unread = [], None, None
             self._scroll_to_new = False
             self._stick_to_bottom = True
@@ -1932,15 +1930,24 @@ class ChatPage(QWidget):
                 self.message_scroll.verticalScrollBar().setValue(max(0, marker.y() - 8))
         self._maybe_mark_read()
 
-    def _maybe_mark_read(self):
-        """Notifications are cleared once the user is at the bottom of the loaded chat."""
+    def _maybe_mark_read(self, at_bottom=None):
+        """At the bottom of the loaded chat everything is read: its count goes to 0, and the server
+        hears about the newest message once. That is decided by the message, not by the count, which
+        can lag behind the server (a push that came while the chat loaded, a list from before a read)."""
         chat_id = self._chat_id
-        if chat_id is None or self._messages_chat != chat_id or not self._at_bottom():
+        if chat_id is None or self._pending or self._messages_chat != chat_id:
+            return
+        if not (self._at_bottom() if at_bottom is None else at_bottom):
             return
         chat = self._chat_data(chat_id)
         if chat and int(chat.get("unread", 0) or 0) > 0:
             self.set_chat_unread(chat_id, 0)
-            self.request_mark_read(chat_id)
+        newest = next((m for m in reversed(self._messages) if m.get("id")), None)
+        if newest is None or self._read_upto.get(chat_id) == newest["id"]:
+            return
+        self._read_upto[chat_id] = newest["id"]
+        if not newest.get("own"):                   # the server marks your own messages read itself
+            self.request_mark_read(chat_id, newest["id"])
 
     def _on_scroll_range_changed(self, low, high):
         if self._stick_to_bottom:
@@ -1951,41 +1958,37 @@ class ChatPage(QWidget):
         if self._stick_to_bottom:
             self._maybe_mark_read()
 
-    # ------------------------------------------------------------------ demo data (preview only)
+    # preview only
     def load_demo_data(self):
         now = datetime.now()
         today = lambda h, m: now.replace(hour=h, minute=m, second=0, microsecond=0)
-        self.set_user_style("Sainen420", BLACK, WHITE)
-        self.set_user_style("lztech", "#DDAACC", "#22282A")
-        self.set_user_style("GreatGodChalkp", WHITE, BLACK)
-        self.set_user_style("moss", "#A6E231", "#2D4007")
+        self.set_user_style("Sainen420", WHITE, BLACK)
+        self.set_user_style("lztech", BLACK, BLUE)
+        self.set_user_style("GreatGodChal...", WHITE, RED)
+        self.set_user_style("moss", BLUE, BLACK)
         self.set_profile("Sainen420")
         self.set_chats([
             {"chat_id": 1, "name": "RECONSTRUCTION 3, 2, 1", "unread": 0, "last_activity": today(11, 29)},
             {"chat_id": 2, "name": "Purgatory", "unread": 66, "last_activity": today(3, 33)},
-            {"chat_id": 3, "name": "gng this group got leaked NO ONE MESSAGE HERE", "unread": 5, "last_activity": datetime(2026, 10, 25)},
+            {"chat_id": 3, "name": "gng this group got...", "unread": 5, "last_activity": datetime(2026, 10, 25)},
             {"chat_id": 4, "name": "lztech", "unread": 0, "is_dm": True, "last_activity": datetime(2026, 10, 15)},
-            {"chat_id": 5, "name": "GreatGodChalkp", "unread": 0, "is_dm": True, "last_activity": datetime(2026, 5, 9)},
+            {"chat_id": 5, "name": "GreatGodChal...", "unread": 0, "is_dm": True, "last_activity": datetime(2026, 5, 9)},
             {"chat_id": 6, "name": "Study Circle", "pending": True},
         ], selected_id=1)
         self.set_members([
             {"username": "Sainen420", "online": True},
             {"username": "lztech", "online": True},
-            {"username": "GreatGodChalkp", "online": True},
+            {"username": "GreatGodChal...", "online": True},
             {"username": "moss", "online": False},
         ])
         d = datetime(2026, 11, 2)
         self.set_messages([
-            {"id": 0, "sender": "lztech", "time": d.replace(hour=11, minute=20),
-            "text": "first"},
             {"id": 1, "sender": "lztech", "time": d.replace(hour=11, minute=24),
              "text": "Starting fresh in here. What should we rebuild first?"},
-            {"id": 2, "sender": "GreatGodChalkp", "time": d.replace(hour=11, minute=25),
+            {"id": 2, "sender": "GreatGodChal...", "time": d.replace(hour=11, minute=25),
              "text": "The **welcome space**. One place for links and a short intro."},
             {"id": 3, "sender": "moss", "time": d.replace(hour=11, minute=26),
              "text": "Yes. Keep the old archive, but make the new rooms *easier* to find."},
-            {"id": 3, "sender": "moss", "time": d.replace(hour=11, minute=27),
-             "text": "Hmmm... The thing can get quite long.\n__This is a LONG MESSAGE__\nThe EoDGram™ Pacer Test is a multistage elemental capacity test that progressively gets more difficult as it continues. The 5 elements pacer test will begin in 30 seconds. Line up at the play channel. The creation speed starts slowly, but gets faster each minute after you hear this signal. [beep] A single set should be completed each time you hear this sound. [ding] Remember to make elements as fast as possible. The second time you fail to complete a set before the sound, your test is over. The test will begin on the word start. On your mark, get ready, start."},
             {"id": 4, "sender": "lztech", "time": d.replace(hour=11, minute=28),
              "text": "I'll sort the links. Can someone draft the __welcome note__?"},
             {"id": 5, "sender": "Sainen420", "own": True, "status": "Sent", "time": d.replace(hour=11, minute=29),
@@ -1994,7 +1997,7 @@ class ChatPage(QWidget):
         self.set_summary("This conversation seems to be relating to setting up the group chat.\n"
                          "Lztech seems to be coordinating the setup of this group chat.")
 
-# if this application is the main, then it's run in TEST mode
+
 if __name__ == "__main__":
     import sys
     from PySide6.QtWidgets import QApplication
@@ -2014,12 +2017,22 @@ if __name__ == "__main__":
             QTimer.singleShot(600, lambda: self.resolve_invite(chat_id, False))
 
         def request_invitees(self, chat_id, query):
-            people = ["lztech", "moss", "GreatGodChalkp"]
+            people = ["lztech", "moss", "GreatGodChal..."]
             hit = [{"user_id": n, "username": n} for n in people if query.lower() in n.lower()]
             QTimer.singleShot(300, lambda: self.set_invitees(chat_id, query, hit))
 
         def request_user_groups(self, username):
             QTimer.singleShot(400, lambda: self.set_user_groups(username, [{"chat_id": 1, "name": "RECONSTRUCTION 3, 2, 1"}, {"chat_id": 2, "name": "Purgatory"}]))
+
+        def request_all_groups(self):
+            groups = [{"chat_id": 1, "name": "RECONSTRUCTION 3, 2, 1", "member_count": 4, "joined": True,
+                       "members": [{"username": n} for n in ("Sainen420", "lztech", "GreatGodChal...", "moss")]},
+                      {"chat_id": 6, "name": "Study Circle", "member_count": 2,
+                       "members": [{"username": n} for n in ("lztech", "moss")]}]
+            QTimer.singleShot(400, lambda: self.set_all_groups(groups))
+
+        def request_join_group(self, chat_id):
+            QTimer.singleShot(600, lambda: self.finish_dialog(True))
 
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_STYLESHEET)

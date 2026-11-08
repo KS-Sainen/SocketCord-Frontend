@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, Signal, QSize, QPointF, QEvent
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QStackedWidget, QListWidget, QListWidgetItem, QAbstractItemView, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
-    QToolButton, QVBoxLayout, QWidget, QColorDialog, QStyle, QStyleOptionComboBox
+    QToolButton, QVBoxLayout, QWidget, QColorDialog, QStyle, QStyleOptionComboBox, QScrollArea
 )
 
 # Palette tokens come from styles.py. Never write a hex colour in this file.
@@ -72,9 +72,6 @@ def search_icon(color):
     return QIcon(px)
 
 
-# ---------------------------------------------------------------------------------------
-# small widgets
-# ---------------------------------------------------------------------------------------
 class ErrorLabel(QLabel):
     """One-line red message after a field label. Long messages are cut with '...'
     (the full text stays in the tooltip) so they can never widen the dialog."""
@@ -198,9 +195,6 @@ class GroupComboBox(QComboBox):
                                  QPointF(c.x(), c.y() + 5)]))
 
 
-# ---------------------------------------------------------------------------------------
-# styling
-# ---------------------------------------------------------------------------------------
 _DIALOG_QSS = Template("""
 QDialog#FormDialog { background-color: $white; }
 QFrame#DialogFrame { background-color: $white; border: 4px solid $black; }
@@ -255,6 +249,19 @@ QListWidget#GroupList {
 QListWidget#GroupList::item { padding: 6px 8px; }
 QListWidget#GroupList::item:selected { background-color: $black; color: $white; }
 
+QScrollArea#GroupScroll, QWidget#GroupColumn { background-color: $white; border: none; }
+QFrame#GroupCard { background-color: $white; border: none; border-bottom: 2px solid $black; }
+QLabel#GroupName { font-size: 14pt; font-weight: bold; }
+QLabel#GroupInfo { font-size: 11pt; }
+QLabel#GroupMembers { font-size: 12pt; }
+QPushButton#JoinButton {
+    background-color: $black; color: $white; border: 2px solid $black;
+    padding: 4px 14px; font-size: 12pt; letter-spacing: 1px;
+}
+QPushButton#JoinButton:pressed,
+QPushButton#JoinButton[status="processing"] { background-color: $white; color: $black; }
+QLabel#JoinedTag { border: 2px solid $black; padding: 4px 8px; font-size: 12pt; letter-spacing: 1px; }
+
 QPushButton#DialogButton {
     background-color: $black; color: $white; border: 2px solid $black;
     padding: 10px; font-size: 17pt; letter-spacing: 1px;
@@ -264,9 +271,6 @@ QPushButton#DialogButton[status="processing"] { background-color: $white; color:
 """).substitute(PALETTE)
 
 
-# ---------------------------------------------------------------------------------------
-# base form
-# ---------------------------------------------------------------------------------------
 class FormDialog(QDialog):
     """Title, labelled fields, CANCEL / SAVE. Subclasses add fields and implement collect()."""
     submitted = Signal(dict)
@@ -316,7 +320,6 @@ class FormDialog(QDialog):
         self.cancel_btn.clicked.connect(self.reject)
         self.submit_btn.clicked.connect(self.submit)
 
-    # ------------------------------------------------------------------ building
     @staticmethod
     def line_edit(text="", password=False, read_only=False, placeholder=""):
         edit = QLineEdit(text)
@@ -349,7 +352,6 @@ class FormDialog(QDialog):
         self._rows[key] = (widget, err)
         return widget
 
-    # ------------------------------------------------------------------ validation
     def collect(self):
         """-> (values dict, errors {key: message}). Subclasses override."""
         return {}, {}
@@ -405,9 +407,6 @@ class FormDialog(QDialog):
             self.status_label.show()
 
 
-# ---------------------------------------------------------------------------------------
-# the forms
-# ---------------------------------------------------------------------------------------
 class EditProfileDialog(FormDialog):
     def __init__(self, username, text_color, background, parent=None):
         super().__init__("Edit profile", parent)
@@ -536,9 +535,7 @@ class GroupsDialog(FormDialog):
         return [self.group_list.item(i).text() for i in range(self.group_list.count())]
 
 
-# ---------------------------------------------------------------------------------------
 # "Invite people": search the people who can be invited, pick one
-# ---------------------------------------------------------------------------------------
 class _SearchEdit(QLineEdit):
     entered = Signal()
 
@@ -654,6 +651,7 @@ class AddPeopleDialog(FormDialog):
         self.chat_id = chat_id
         self._query = None
         self.search_field = self.add_field("search", "Search", SearchField())
+        self.search_field.edit.setMaxLength(32)             # GET chat/{id}/invitees refuses a longer query
         self.results = self.add_field("user", "Users", ResultsField())
         self.search_field.searched.connect(self.search)
         self.search_field.setFocus()
@@ -674,3 +672,147 @@ class AddPeopleDialog(FormDialog):
             return {}, {"user": "Select a user"}
         return {"username": user.get("username", ""), "chat_id": self.chat_id,
                 "user_id": user.get("user_id")}, {}
+
+
+# "Browse groups": every group on the server with its members, and JOIN
+def _wrapped_label(text, name):
+    label = QLabel(str(text))
+    label.setObjectName(name)
+    label.setTextFormat(Qt.PlainText)                   # group and user names other people chose
+    label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+    label.setWordWrap(True)                             # after the size policy: it adds height-for-width to it
+    return label
+
+
+class GroupCard(QFrame):
+    """One group: its name, how many members it has, every member's name, and JOIN (or JOINED)."""
+    join_clicked = Signal(object)
+
+    def __init__(self, group, invited=False, parent=None):
+        super().__init__(parent)
+        self.setObjectName("GroupCard")
+        self.chat_id = group.get("chat_id")
+        members = [str(m.get("username") or "") for m in group.get("members") or []]
+        total = int(group.get("member_count") or len(members))
+        info = f"{total} member{'' if total == 1 else 's'}" + (" · you're invited" if invited else "")
+        names = ", ".join(members) + (f" and {total - len(members)} more" if total > len(members) else "")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 8, 10, 10)
+        row.setSpacing(10)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        self.name_label = _wrapped_label(group.get("name", ""), "GroupName")
+        self.info_label = _wrapped_label(info, "GroupInfo")
+        self.members_label = _wrapped_label(names, "GroupMembers")
+        for label in (self.name_label, self.info_label, self.members_label):
+            text.addWidget(label)
+        row.addLayout(text, 1)
+        if group.get("joined"):
+            self.action = QLabel("JOINED")
+            self.action.setObjectName("JoinedTag")
+        else:
+            self.action = QPushButton("JOIN")
+            self.action.setObjectName("JoinButton")
+            self.action.setProperty("status", "pending")
+            self.action.setCursor(Qt.PointingHandCursor)
+            self.action.setAutoDefault(False)
+            self.action.clicked.connect(lambda: self.join_clicked.emit(self.chat_id))
+        row.addWidget(self.action, 0, Qt.AlignVCenter)
+
+
+class GroupCardsField(QFrame):
+    """The group cards in a scrolling column. When there is nothing to list, a message sits in the
+    middle of the field instead, as in the Invite people results."""
+    LIST, MESSAGE = 0, 1
+    join_clicked = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ResultsFrame")
+        self.setFixedHeight(330)
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        self.stack = QStackedWidget()
+        box.addWidget(self.stack)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("GroupScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        column = QWidget()
+        column.setObjectName("GroupColumn")
+        self._column = QVBoxLayout(column)
+        self._column.setContentsMargins(0, 0, 0, 0)
+        self._column.setSpacing(0)
+        self._column.addStretch(1)
+        self.scroll.setWidget(column)
+        self.message = QLabel("")
+        self.message.setObjectName("ResultsMessage")
+        self.message.setAlignment(Qt.AlignCenter)
+        self.message.setWordWrap(True)
+        self.stack.addWidget(self.scroll)
+        self.stack.addWidget(self.message)
+        self.cards = []
+
+    def show_message(self, text):
+        self.message.setText(text)
+        self.stack.setCurrentIndex(self.MESSAGE)
+
+    def set_groups(self, groups, invited=()):
+        """Rebuilt in place, so a refresh keeps the scroll position."""
+        while self.cards:
+            old = self.cards.pop()
+            self._column.removeWidget(old)
+            old.setParent(None)
+            old.deleteLater()
+        if not groups:
+            self.show_message("No groups yet")
+            return
+        for g in groups:
+            card = GroupCard(g, g.get("chat_id") in invited)
+            card.join_clicked.connect(self.join_clicked)
+            self._column.insertWidget(len(self.cards), card)
+            self.cards.append(card)
+        self.stack.setCurrentIndex(self.LIST)
+
+
+class BrowseGroupsDialog(FormDialog):
+    """'Browse Groups': every group on the server, whoever made it, with its members. Opens with
+    'Loading...', then set_groups(), which the owner calls again whenever a push changes a group.
+    JOIN emits submitted({'chat_id'}); the owner answers with finish(ok, message)."""
+    def __init__(self, parent=None):
+        super().__init__("Browse groups", parent, submit_text="CLOSE")
+        self.cancel_btn.hide()
+        self.submit_btn.clicked.disconnect(self.submit)     # nothing to validate or send
+        self.submit_btn.clicked.connect(self.accept)
+        self._joining = None
+        self.groups_field = self.add_field("groups", "All groups", GroupCardsField())
+        self.groups_field.join_clicked.connect(self.join)
+        self.groups_field.show_message("Loading...")
+
+    def set_groups(self, groups, invited=()):
+        """groups: GET chats/groups rows; invited: chat_ids with a pending invitation (JOIN accepts it)."""
+        self.groups_field.set_groups(groups, invited)
+        self._sync_join_buttons()
+
+    def join(self, chat_id):
+        if self._busy:
+            return                                  # a JOIN is already on its way
+        self.clear_errors()
+        self._busy, self._joining = True, chat_id
+        self._sync_join_buttons()
+        self.submitted.emit({"chat_id": chat_id})
+
+    def finish(self, ok, message="", field=None):
+        self._joining = None
+        self._sync_join_buttons()
+        super().finish(ok, message, field)          # a failure shows under the list
+
+    def _sync_join_buttons(self):
+        for card in self.groups_field.cards:
+            if isinstance(card.action, QPushButton):
+                _set_prop(card.action, "status", "processing" if card.chat_id == self._joining else "pending")
+
+    def shown_groups(self):
+        return [{"chat_id": c.chat_id, "name": c.name_label.text(), "info": c.info_label.text(),
+                 "members": c.members_label.text(), "action": c.action.text()}
+                for c in self.groups_field.cards]
