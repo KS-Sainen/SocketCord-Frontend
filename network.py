@@ -13,9 +13,9 @@ class SocketCordNetwork(QThread):
     reply_message = Signal(int, object)
     # recv_buffer = bytearray()
     error = Signal(str)
-
     # connected = False
     # running = True
+
     def __init__(self, host, port):
         super().__init__()
         self.host = host
@@ -62,9 +62,7 @@ class SocketCordNetwork(QThread):
     def on_closed(self):
         self._stop('Connection Closed')
     # Connects to that socket (THE Connect)
-    # Not named connect(): overriding QObject.connect breaks `signal.connect(slot)` on this
-    # object in some PySide6 versions (6.8 calls the Python method).
-    def open_connection(self):
+    def connect(self):
         if self._active():
             self.error.emit("Already Connected or Connecting")
             return
@@ -133,7 +131,6 @@ class SocketCordNetwork(QThread):
         except OSError as e:
             self.error.emit(f"Packet Receiving Error: {str(e)}")
             self._stop('Connection Lost')
-            return
         if not data:
             self.on_closed()
             return

@@ -83,7 +83,7 @@ class LoginPage(QWidget):
         btn_layout.setContentsMargins(14, 4, 14, 0)
         self.signup_btn = QPushButton("SIGN UP")
         self.login_btn = QPushButton("LOG IN")
-        for btn in (self.signup_btn, self.login_btn):  # all button setting
+        for btn in (self.signup_btn, self.login_btn): # all button setting
             btn.setProperty('status','pending')
             btn.setFixedSize(160, 56)
         btn_layout.addWidget(self.signup_btn)
@@ -123,7 +123,7 @@ class LoginPage(QWidget):
 
     # form validation
     def _read_form(self):
-        errs = []  # error array
+        errs = [] # error array
         # reset status
         for row, (text, field) in enumerate(self.form_rows):
             self._set_prop(field, 'status', 'ok')
@@ -172,12 +172,14 @@ class LoginPage(QWidget):
 
     # router functions
     def router(self, status_code, path, data_obj):
-        # only the sign-up reply reaches here, so the path is not looked at
-        # path_spl = path.split('/')
-        # honestly, only the created user reply reaches here, so only handle by the connection
         self.reset_buttons()
-        if status_code == 200:
-            self.set_status("User successfully created!", True)
+        if status_code != 200:
+            self.set_status(str(data_obj.get('detail') or data_obj.get('error') or
+                                f'Request failed ({status_code})'), False)
+        elif path == 'login/created':
+            self.set_status('User successfully created! Please log in.', True)
+        elif path == 'login/success':
+            self.set_status('Logged in.', True)
     def set_status(self, text: str, success: bool = True):
         # colour comes from the stylesheet ([state="ok"] -> blue, otherwise red)
         self.status_label.setProperty("state", "ok" if success else "error")
